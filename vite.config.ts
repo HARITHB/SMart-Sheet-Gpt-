@@ -86,6 +86,166 @@ function sheetGptApiPlugin(): Plugin {
           });
         };
 
+        if (req.method === 'POST' && req.url === '/api/ai-plan') {
+          try {
+            const body = await readBody();
+            const { instruction, headers } = body;
+
+            if (!instruction || typeof instruction !== 'string') {
+              res.statusCode = 400;
+              res.setHeader('Content-Type', 'application/json');
+              return res.end(JSON.stringify({ error: 'Instruction is required' }));
+            }
+
+            const headerList = Array.isArray(headers) ? headers : [];
+            const apiKey = process.env.GEMINI_API_KEY;
+
+            let planResult = null;
+
+            if (apiKey) {
+              try {
+                const ai = new GoogleGenAI({
+                  apiKey,
+                  httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+                });
+
+                const prompt = `You are TidyRow's structured data-cleaning planner.
+User wants to clean a spreadsheet with columns: [${headerList.join(', ')}].
+Instruction: "${instruction}"
+
+Break down this request into an ordered sequence of concrete, transparent cleaning steps.
+Allowed actions: "trim", "titlecase", "normalize_phone", "extract_zip", "extract_email", "deduplicate", "fill_missing", "sentiment", "custom_ai".
+Mark each step as deterministic (true for algorithmic operations like trim, case, deduplicate, regex, fill_missing; false for semantic AI inference).
+
+Return ONLY raw JSON with:
+{
+  "summary": "Short 1-line description of the cleaning goal",
+  "steps": [
+    {
+      "id": "step_1",
+      "title": "Clear action title",
+      "action": "trim" | "titlecase" | "normalize_phone" | "extract_zip" | "extract_email" | "deduplicate" | "fill_missing" | "sentiment" | "custom_ai",
+      "columns": ["matching_column_names"],
+      "enabled": true,
+      "deterministic": true | false,
+      "reason": "Clear explanation of why this step is needed",
+      "confidence": "high" | "medium" | "review"
+    }
+  ]
+}`;
+                const text = await generateContentWithFallback(ai, prompt);
+                try {
+                  planResult = JSON.parse(text);
+                } catch {
+                  const match = text.match(/\{[\s\S]*\}/);
+                  if (match) planResult = JSON.parse(match[0]);
+                }
+              } catch (aiErr) {
+                console.warn('AI plan generation fallback to heuristic:', aiErr);
+              }
+            }
+
+            // Fallback heuristic planner if AI was offline or parse failed
+            if (!planResult || !Array.isArray(planResult.steps) || planResult.steps.length === 0) {
+              const lowerInst = instruction.toLowerCase();
+              const steps: any[] = [
+                {
+                  id: 'step_trim',
+                  title: 'Trim whitespace across all columns',
+                  action: 'trim',
+                  enabled: true,
+                  deterministic: true,
+                  reason: 'Eliminate trailing tabs and spaces that break lookups and sorting',
+                  confidence: 'high',
+                },
+              ];
+
+              if (lowerInst.includes('crm') || lowerInst.includes('salesforce') || lowerInst.includes('lead') || lowerInst.includes('name') || lowerInst.includes('case')) {
+                const nameCol = headerList.find(h => /(name|customer|lead|contact)/i.test(h));
+                steps.push({
+                  id: 'step_titlecase',
+                  title: `Standardize ${nameCol || 'names'} to Title Case`,
+                  action: 'titlecase',
+                  column: nameCol,
+                  enabled: true,
+                  deterministic: true,
+                  reason: 'Convert inconsistent UPPERCASE and lowercase into professional casing',
+                  confidence: 'high',
+                });
+              }
+
+              if (lowerInst.includes('crm') || lowerInst.includes('phone') || lowerInst.includes('mobile') || lowerInst.includes('contact')) {
+                const phoneCol = headerList.find(h => /(phone|mobile|tel)/i.test(h));
+                if (phoneCol) {
+                  steps.push({
+                    id: 'step_phone',
+                    title: `Normalize phone numbers in "${phoneCol}"`,
+                    action: 'normalize_phone',
+                    column: phoneCol,
+                    enabled: true,
+                    deterministic: true,
+                    reason: 'Apply consistent formatting with standard separators without altering digits',
+                    confidence: 'high',
+                  });
+                }
+              }
+
+              if (lowerInst.includes('duplicate') || lowerInst.includes('crm') || lowerInst.includes('dedup') || lowerInst.includes('clean')) {
+                steps.push({
+                  id: 'step_dedup',
+                  title: 'Remove duplicate rows',
+                  action: 'deduplicate',
+                  enabled: true,
+                  deterministic: true,
+                  reason: 'Ensure each record is unique across the entire dataset',
+                  confidence: 'high',
+                });
+              }
+
+              if (lowerInst.includes('zip') || lowerInst.includes('address') || lowerInst.includes('postal')) {
+                const addrCol = headerList.find(h => /(address|street|addr)/i.test(h));
+                if (addrCol) {
+                  steps.push({
+                    id: 'step_zip',
+                    title: `Extract 5-digit US ZIP code from "${addrCol}"`,
+                    action: 'extract_zip',
+                    column: addrCol,
+                    enabled: true,
+                    deterministic: true,
+                    reason: 'Parse postal code into standard format',
+                    confidence: 'high',
+                  });
+                }
+              }
+
+              if (lowerInst.includes('missing') || lowerInst.includes('empty') || lowerInst.includes('fill') || lowerInst.includes('crm')) {
+                steps.push({
+                  id: 'step_fill',
+                  title: 'Fill empty cells with explicit "N/A" marker',
+                  action: 'fill_missing',
+                  enabled: true,
+                  deterministic: true,
+                  reason: 'Distinguish intentional missing data from blank formatting',
+                  confidence: 'high',
+                });
+              }
+
+              planResult = {
+                summary: `Structured Cleaning Plan for "${instruction}"`,
+                steps,
+              };
+            }
+
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify(planResult));
+          } catch (err: any) {
+            res.statusCode = 500;
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify({ error: err?.message || 'Plan generation failed' }));
+          }
+        }
+
         if (req.method === 'POST' && req.url === '/api/ai-clean') {
           try {
             const body = await readBody();
