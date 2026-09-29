@@ -1,0 +1,6 @@
+{
+  "name": "SheetGPT",
+  "description": "AI-powered spreadsheet application with formula intelligence and automated data processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
