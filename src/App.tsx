@@ -28,6 +28,10 @@ import {
   FileText,
   Sliders,
   Undo2,
+  Layers,
+  Filter,
+  Mail,
+  Phone,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -85,6 +89,12 @@ import {
   suggestSchemaMapping,
   CRM_TARGET_SCHEMA,
 } from '@/lib/schemaMapping';
+import { parseExcelFile, exportToExcel } from '@/lib/excel';
+import {
+  DESTINATION_PACKS,
+  type DestinationPack,
+} from '@/lib/destinationReadiness';
+import type { MergeResult } from '@/lib/datasetMerge';
 
 // Landing Page Components
 import { Navbar } from '@/components/landing/Navbar';
@@ -105,6 +115,9 @@ import { UploadZone } from '@/components/workspace/UploadZone';
 import { CleaningPlan } from '@/components/workspace/CleaningPlan';
 import { BeforeAfterReview } from '@/components/workspace/BeforeAfterReview';
 import { SchemaMappingDialog } from '@/components/workspace/SchemaMappingDialog';
+import { DataHealthReport } from '@/components/workspace/DataHealthReport';
+import { DestinationReadinessCard } from '@/components/workspace/DestinationReadinessCard';
+import { MultiFileMergeDialog } from '@/components/workspace/MultiFileMergeDialog';
 
 interface CsvData {
   fileName: string;
@@ -137,6 +150,9 @@ const TRANSFORM_RULES: TransformRule[] = [
   'extract_zip',
   'extract_email',
   'fill_missing',
+  'normalize_city',
+  'normalize_country',
+  'normalize_company',
 ];
 
 const AI_SUGGESTIONS = [
@@ -145,7 +161,7 @@ const AI_SUGGESTIONS = [
   'Normalize all dates to YYYY-MM-DD',
   'Remove extra whitespace and trim all fields',
   'Standardize state names to two-letter abbreviations',
-  'Fill empty cells with "N/A"',
+  'Standardize city names (HYD to Hyderabad, NYC to New York)',
 ];
 
 const SAMPLE_ECOMMERCE_CSV = `Order ID,Customer Name,Shipping Address,Phone,Order Total,Order Date,Status
@@ -207,6 +223,13 @@ export default function App() {
   // Schema Mapping Dialog State
   const [schemaMappingOpen, setSchemaMappingOpen] = useState(false);
 
+  // Multi-File Merge State
+  const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  const [mergeNotification, setMergeNotification] = useState<string | null>(null);
+
+  // Issue Filtering in Data Preview
+  const [activeIssueFilter, setActiveIssueFilter] = useState<string | null>(null);
+
   const [isDragging, setIsDragging] = useState(false);
   const [isParsing, setIsParsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
@@ -234,7 +257,7 @@ export default function App() {
   });
   const cancelProcessingRef = useRef(false);
 
-  // Load saved workflows from localStorage on mount
+  // Load saved workflows on mount
   useEffect(() => {
     setSavedWorkflows(loadSavedWorkflows());
   }, []);
@@ -268,6 +291,8 @@ export default function App() {
     setHasAppliedCleanups(false);
     setHistory([]);
     setCurrentPage(1);
+    setActiveIssueFilter(null);
+    setMergeNotification(null);
 
     Papa.parse<Record<string, string>>(csvContent, {
       header: true,
@@ -299,8 +324,16 @@ export default function App() {
 
   const handleFile = useCallback((file: File) => {
     const fileNameLower = file.name.toLowerCase();
-    if (!fileNameLower.endsWith('.csv') && !fileNameLower.endsWith('.tsv') && !fileNameLower.endsWith('.txt')) {
-      setParseError("We couldn't read this file format. TidyRow currently supports .csv and .tsv spreadsheets.");
+    const isExcel = fileNameLower.endsWith('.xlsx') || fileNameLower.endsWith('.xls');
+    const isCsvTsv =
+      fileNameLower.endsWith('.csv') ||
+      fileNameLower.endsWith('.tsv') ||
+      fileNameLower.endsWith('.txt');
+
+    if (!isExcel && !isCsvTsv) {
+      setParseError(
+        "We couldn't read this file format. TidyRow supports .csv, .tsv, and .xlsx spreadsheets."
+      );
       setCsvData(null);
       return;
     }
@@ -315,6 +348,37 @@ export default function App() {
     setHasAppliedCleanups(false);
     setHistory([]);
     setCurrentPage(1);
+    setActiveIssueFilter(null);
+    setMergeNotification(null);
+
+    if (isExcel) {
+      parseExcelFile(file)
+        .then((parsed) => {
+          if (parsed.rows.length === 0) {
+            setParseError('The uploaded Excel sheet contains no data rows.');
+            setIsParsing(false);
+            return;
+          }
+          setCsvData({
+            fileName: parsed.fileName,
+            fileSize: parsed.fileSize,
+            headers: parsed.headers,
+            rows: parsed.rows,
+            totalRows: parsed.rows.length,
+            errors: 0,
+          });
+          setOriginalRows(parsed.rows.map((r) => ({ ...r })));
+          setBeforeAnalysis(analyzeDataset(parsed.headers, parsed.rows));
+          setCurrentPage(1);
+          setIsParsing(false);
+          setCurrentView('workspace');
+        })
+        .catch((err) => {
+          setParseError(`Excel parse error: ${err.message}`);
+          setIsParsing(false);
+        });
+      return;
+    }
 
     Papa.parse<Record<string, string>>(file, {
       header: true,
@@ -383,6 +447,8 @@ export default function App() {
     setHasAppliedCleanups(false);
     setHistory([]);
     setCurrentPage(1);
+    setActiveIssueFilter(null);
+    setMergeNotification(null);
   }, []);
 
   // Standard Transform on entire dataset
@@ -413,7 +479,7 @@ export default function App() {
     [csvData, pushHistory]
   );
 
-  // Full export CSV of entire dataset
+  // Full export CSV
   const handleExportCsv = useCallback(() => {
     if (!csvData) return;
     const csvString = Papa.unparse(csvData.rows, {
@@ -432,6 +498,12 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+  }, [csvData]);
+
+  // Full export Excel (.xlsx)
+  const handleExportExcel = useCallback(() => {
+    if (!csvData) return;
+    exportToExcel(csvData.fileName, csvData.rows);
   }, [csvData]);
 
   // AI Sentiment in batches of 100 rows
@@ -664,7 +736,7 @@ export default function App() {
     }
   }, [csvData, aiInstruction, aiSelectedColumns, pushHistory]);
 
-  // Live Dataset Analysis
+  // Live Dataset Analysis via Data Quality Engine 2.0
   const analysis = useMemo<DatasetAnalysis>(() => {
     if (!csvData) {
       return {
@@ -680,6 +752,14 @@ export default function App() {
         qualityScore: 100,
         statusLabel: 'No data',
         statusTone: 'clean',
+        dimensions: {
+          completeness: 100,
+          validity: 100,
+          consistency: 100,
+          uniqueness: 100,
+          overall: 100,
+        },
+        columnProfiles: [],
         issues: [],
         flags: [],
         fuzzyDuplicates: [],
@@ -694,7 +774,7 @@ export default function App() {
     return generateChangeLog(csvData.headers, originalRows, csvData.rows, 'TidyRow Standard Cleanup');
   }, [csvData?.headers, csvData?.rows, originalRows]);
 
-  // Live Clean Actions from Cleaning Plan
+  // Live Clean Actions
   const handleRemoveDuplicates = useCallback(() => {
     if (!csvData) return;
     pushHistory(csvData.rows);
@@ -746,7 +826,6 @@ export default function App() {
       const updated = { ...row };
       for (const h of csvData.headers) {
         const val = (updated[h] ?? '').trim().toLowerCase();
-        // Standardize explicit placeholder tokens, leave genuinely blank cells intact
         if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
           updated[h] = '—';
         }
@@ -785,7 +864,14 @@ export default function App() {
       }
     }
 
-    // Note: Genuinely blank cells are deliberately NOT converted to N/A to preserve data integrity (V2 Section 9)
+    // 4. Standardize canonical city/state variations
+    for (const h of csvData.headers) {
+      if (/(city|location|town)/i.test(h)) {
+        processedRows = transformColumn(processedRows, h, 'normalize_city');
+      } else if (/(country|nation)/i.test(h)) {
+        processedRows = transformColumn(processedRows, h, 'normalize_country');
+      }
+    }
 
     setCsvData((prev) => {
       if (!prev) return prev;
@@ -799,7 +885,7 @@ export default function App() {
     setShowBeforeAfter(true);
   }, [csvData, pushHistory]);
 
-  // Execute an arbitrary structured plan (Phase 7 & 15)
+  // Execute an arbitrary structured plan
   const handleExecutePlan = useCallback(
     async (steps: CleaningStep[]) => {
       if (!csvData || steps.length === 0) return;
@@ -851,8 +937,8 @@ export default function App() {
               const updated = { ...row };
               for (const h of csvData.headers) {
                 const val = (updated[h] ?? '').trim().toLowerCase();
-                if (val === '' || val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
-                  updated[h] = 'N/A';
+                if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
+                  updated[h] = '—';
                 }
               }
               return updated;
@@ -888,7 +974,7 @@ export default function App() {
   // Save current plan as reusable workflow
   const handleSaveCurrentAsWorkflow = useCallback(
     (name: string, description: string, steps: CleaningStep[]) => {
-      const saved = saveUserWorkflow({
+      saveUserWorkflow({
         name,
         description,
         steps,
@@ -899,7 +985,7 @@ export default function App() {
     []
   );
 
-  // Apply Schema Mapping (Phase 15)
+  // Apply Schema Mapping
   const handleApplySchemaMapping = useCallback(
     (mapping: Record<string, string>) => {
       if (!csvData) return;
@@ -920,18 +1006,71 @@ export default function App() {
     [csvData, pushHistory]
   );
 
-  // Column stats for quick header type indicators
-  const columnStats = useMemo(() => {
-    if (!csvData) return [];
-    const sampleLimit = Math.min(csvData.rows.length, 2000);
-    return csvData.headers.map((header) => {
-      const sampleValues: string[] = [];
-      for (let i = 0; i < sampleLimit; i++) {
-        sampleValues.push(csvData.rows[i][header] ?? '');
+  // Apply Destination Readiness Fixes
+  const handleApplyDestinationFixes = useCallback(
+    async (pack: DestinationPack, mapping: Record<string, string>, steps: CleaningStep[]) => {
+      if (!csvData) return;
+      pushHistory(csvData.rows);
+
+      const { newHeaders, newRows } = applySchemaMapping(csvData.rows, mapping);
+      let workingRows = [...newRows];
+
+      for (const step of steps) {
+        if (!step.enabled) continue;
+        if (step.action === 'trim') {
+          for (const h of newHeaders) {
+            workingRows = transformColumn(workingRows, h, 'trim');
+          }
+        } else if (step.action === 'deduplicate') {
+          workingRows = deduplicateRows(newHeaders, workingRows);
+        } else if (step.action === 'titlecase') {
+          for (const h of newHeaders) {
+            if (/(name|firstname|lastname|fullname|title)/i.test(h)) {
+              workingRows = transformColumn(workingRows, h, 'titlecase');
+            }
+          }
+        } else if (step.action === 'normalize_phone') {
+          for (const h of newHeaders) {
+            if (/(phone|mobile|tel)/i.test(h)) {
+              workingRows = transformColumn(workingRows, h, 'normalize_phone');
+            }
+          }
+        }
       }
-      return inferColumnType(sampleValues, header);
-    });
-  }, [csvData?.headers, csvData?.rows]);
+
+      setCsvData({
+        ...csvData,
+        headers: newHeaders,
+        rows: workingRows,
+        totalRows: workingRows.length,
+      });
+      setHasAppliedCleanups(true);
+      setShowBeforeAfter(true);
+    },
+    [csvData, pushHistory]
+  );
+
+  // Multi-File Merge Complete
+  const handleMergeComplete = useCallback(
+    (result: MergeResult, secondaryFileName: string) => {
+      if (!csvData) return;
+      pushHistory(csvData.rows);
+
+      setCsvData({
+        ...csvData,
+        headers: result.mergedHeaders,
+        rows: result.mergedRows,
+        totalRows: result.mergedRows.length,
+      });
+
+      setMergeNotification(
+        `Merged "${secondaryFileName}": ${result.stats.matchedCount} records matched, ${result.stats.secondaryOnlyCount} new records appended, ${result.stats.conflictCount} conflicts resolved.`
+      );
+      setHasAppliedCleanups(true);
+      setShowBeforeAfter(true);
+    },
+    [csvData, pushHistory]
+  );
 
   const totalTransforms = useMemo(() => {
     return Object.values(appliedTransforms).reduce(
@@ -940,14 +1079,28 @@ export default function App() {
     );
   }, [appliedTransforms]);
 
-  const totalPages = Math.max(1, Math.ceil((csvData?.rows.length || 0) / ROWS_PER_PAGE));
+  // Issue filter row calculations
+  const issueFilteredIndices = useMemo(() => {
+    if (!activeIssueFilter || !analysis) return null;
+    const issue = analysis.issues.find((i) => i.id === activeIssueFilter);
+    return issue?.affectedRowIndices || null;
+  }, [activeIssueFilter, analysis]);
+
+  const displayedRows = useMemo(() => {
+    if (!csvData) return [];
+    if (issueFilteredIndices) {
+      return issueFilteredIndices.map((idx) => csvData.rows[idx]).filter(Boolean);
+    }
+    return csvData.rows;
+  }, [csvData, issueFilteredIndices]);
+
+  const totalPages = Math.max(1, Math.ceil(displayedRows.length / ROWS_PER_PAGE));
   const startIndex = (currentPage - 1) * ROWS_PER_PAGE;
-  const endIndex = Math.min(startIndex + ROWS_PER_PAGE, csvData?.rows.length || 0);
+  const endIndex = Math.min(startIndex + ROWS_PER_PAGE, displayedRows.length);
 
   const visibleRows = useMemo(() => {
-    if (!csvData) return [];
-    return csvData.rows.slice(startIndex, endIndex);
-  }, [csvData?.rows, startIndex, endIndex]);
+    return displayedRows.slice(startIndex, endIndex);
+  }, [displayedRows, startIndex, endIndex]);
 
   // Calculate workflow step
   const activeStep = useMemo<'upload' | 'understand' | 'clean' | 'verify'>(() => {
@@ -1009,10 +1162,12 @@ export default function App() {
         onUndo={handleUndo}
         canUndo={history.length > 0}
         onExport={handleExportCsv}
+        onExportExcel={handleExportExcel}
         onExportChangeLog={() => {
           if (csvData) exportChangeLogCsv(csvData.fileName, changeLog);
         }}
         onOpenAiClean={openAiDialog}
+        onOpenMerge={() => setMergeDialogOpen(true)}
         showBeforeAfter={showBeforeAfter}
         onToggleBeforeAfter={() => setShowBeforeAfter((prev) => !prev)}
         hasModifications={hasModifications}
@@ -1037,7 +1192,45 @@ export default function App() {
         ) : (
           /* Data Loaded State: Steps 02 to 05 */
           <div className="animate-fade-in space-y-6">
-            {/* Step 02 & 03: Live Issue Detection & Cleaning Plan */}
+            {/* Merge notification banner */}
+            {mergeNotification && (
+              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-900 text-xs flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-[#2F8F6B]" />
+                  <span>{mergeNotification}</span>
+                </div>
+                <button
+                  onClick={() => setMergeNotification(null)}
+                  className="text-emerald-700 hover:text-emerald-900 cursor-pointer"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+
+            {/* Primary Differentiator: Destination Readiness & Schema Packs */}
+            <DestinationReadinessCard
+              headers={csvData.headers}
+              rows={csvData.rows}
+              fileName={csvData.fileName}
+              onApplyDestinationFixes={handleApplyDestinationFixes}
+            />
+
+            {/* Core Value: Data Quality Engine 2.0 & Health Report */}
+            <DataHealthReport
+              analysis={analysis}
+              onFilterByIssue={(issueId) => {
+                setActiveIssueFilter(issueId);
+                setCurrentPage(1);
+              }}
+              activeIssueFilter={activeIssueFilter}
+              onClearIssueFilter={() => {
+                setActiveIssueFilter(null);
+                setCurrentPage(1);
+              }}
+            />
+
+            {/* Live Issue Detection & Transparent Cleaning Plan */}
             <CleaningPlan
               fileName={csvData.fileName}
               analysis={analysis}
@@ -1056,7 +1249,7 @@ export default function App() {
               hasAppliedCleanups={hasAppliedCleanups}
             />
 
-            {/* Step 05: Live Before/After Review Diff & Post-Clean Validation */}
+            {/* Live Before/After Review Diff & Post-Clean Validation */}
             {showBeforeAfter && originalRows.length > 0 && (
               <BeforeAfterReview
                 fileName={csvData.fileName}
@@ -1070,10 +1263,11 @@ export default function App() {
                 onReset={handleRemoveFile}
                 onClose={() => setShowBeforeAfter(false)}
                 onExport={handleExportCsv}
+                onExportExcel={handleExportExcel}
               />
             )}
 
-            {/* Step 04: Full Data Table with Inline Types & Header Transforms */}
+            {/* Data Table with Inline Types & Column Transforms */}
             <div className="rounded-2xl border border-[#E5E5DE] bg-white p-4 sm:p-5 shadow-xs">
               <div className="mb-3.5 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
@@ -1086,6 +1280,11 @@ export default function App() {
                   <span className="font-mono text-xs text-[#202522]/60">
                     ({csvData.rows.length.toLocaleString()} total rows in memory)
                   </span>
+                  {activeIssueFilter && (
+                    <span className="font-mono text-[10px] text-amber-800 bg-amber-100 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
+                      <Filter className="h-2.5 w-2.5" /> Filtering {displayedRows.length} affected rows
+                    </span>
+                  )}
                   {history.length > 0 && (
                     <span className="font-mono text-[10px] text-[#2F8F6B] bg-[#2F8F6B]/10 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
                       <Undo2 className="h-2.5 w-2.5" /> {history.length} undo step{history.length > 1 ? 's' : ''} available
@@ -1097,7 +1296,7 @@ export default function App() {
                   <span>
                     Showing rows <span className="font-semibold text-[#202522] font-mono">{startIndex + 1}</span>–
                     <span className="font-semibold text-[#202522] font-mono">{endIndex}</span> of{' '}
-                    <span className="font-semibold text-[#202522] font-mono">{csvData.rows.length.toLocaleString()}</span>
+                    <span className="font-semibold text-[#202522] font-mono">{displayedRows.length.toLocaleString()}</span>
                   </span>
                 </div>
               </div>
@@ -1113,7 +1312,8 @@ export default function App() {
                         </TableHead>
                         {csvData.headers.map((header, i) => {
                           const transforms = appliedTransforms[header] ?? [];
-                          const colType = columnStats[i]?.type ?? 'text';
+                          const colProfile = analysis.columnProfiles.find((c) => c.columnName === header);
+                          const colType = colProfile?.inferredType ?? 'text';
 
                           return (
                             <TableHead
@@ -1133,6 +1333,8 @@ export default function App() {
                                         {colType === 'text' && <Type className="h-2.5 w-2.5 shrink-0" />}
                                         {colType === 'date' && <Calendar className="h-2.5 w-2.5 shrink-0" />}
                                         {colType === 'boolean' && <Binary className="h-2.5 w-2.5 shrink-0" />}
+                                        {colType === 'email' && <Mail className="h-2.5 w-2.5 shrink-0 text-[#4D7CFE]" />}
+                                        {colType === 'phone' && <Phone className="h-2.5 w-2.5 shrink-0 text-[#2F8F6B]" />}
                                         <span>{colType}</span>
                                       </span>
                                     </div>
@@ -1282,7 +1484,7 @@ export default function App() {
                   <div className="text-[#202522]/70 font-sans">
                     Showing rows <span className="font-semibold text-[#202522] font-mono">{startIndex + 1}</span> to{' '}
                     <span className="font-semibold text-[#202522] font-mono">{endIndex}</span> of{' '}
-                    <span className="font-semibold text-[#202522] font-mono">{csvData.rows.length.toLocaleString()}</span>
+                    <span className="font-semibold text-[#202522] font-mono">{displayedRows.length.toLocaleString()}</span>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -1318,9 +1520,16 @@ export default function App() {
 
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-[#202522]/60 font-sans">
                 <p>
-                  Tip: Click any column header to apply uppercase, lowercase, title case, or phone normalization across all {csvData.rows.length.toLocaleString()} rows.
+                  Tip: Cleaned files can be exported as standard CSV or Microsoft Excel (.xlsx) with full change-log audit trails.
                 </p>
                 <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setMergeDialogOpen(true)}
+                    className="text-[#202522] font-semibold hover:underline cursor-pointer flex items-center gap-1"
+                  >
+                    <Layers className="h-3 w-3" />
+                    <span>Merge Secondary Dataset</span>
+                  </button>
                   <button
                     onClick={() => setSchemaMappingOpen(true)}
                     className="text-[#4D7CFE] font-semibold hover:underline cursor-pointer"
@@ -1339,6 +1548,18 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Multi-File Merge Dialog */}
+      {csvData && (
+        <MultiFileMergeDialog
+          open={mergeDialogOpen}
+          onOpenChange={setMergeDialogOpen}
+          primaryFileName={csvData.fileName}
+          primaryHeaders={csvData.headers}
+          primaryRows={csvData.rows}
+          onMergeComplete={handleMergeComplete}
+        />
+      )}
 
       {/* Schema Mapping Dialog */}
       {csvData && (
@@ -1398,7 +1619,6 @@ export default function App() {
           </DialogHeader>
 
           <div className="py-3 space-y-4">
-            {/* Progress bar and counter */}
             <div className="space-y-1.5">
               <div className="flex justify-between items-center text-xs">
                 <span className="font-medium text-[#202522] font-sans">
@@ -1493,7 +1713,6 @@ export default function App() {
           </DialogHeader>
 
           <div className="space-y-4">
-            {/* Column selection */}
             <div>
               <label className="mb-2 block text-xs font-semibold text-[#202522] font-sans">
                 Columns to clean
@@ -1521,7 +1740,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Instruction input */}
             <div>
               <label className="mb-2 block text-xs font-semibold text-[#202522] font-sans">
                 Cleaning instruction
@@ -1535,7 +1753,6 @@ export default function App() {
               />
             </div>
 
-            {/* Suggestions */}
             <div>
               <p className="mb-2 text-xs text-[#202522]/60 font-sans">Suggested cleaning prompts:</p>
               <div className="flex flex-wrap gap-2">

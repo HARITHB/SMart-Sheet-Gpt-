@@ -29,6 +29,7 @@ interface BeforeAfterReviewProps {
   onReset: () => void;
   onClose: () => void;
   onExport: () => void;
+  onExportExcel?: () => void;
 }
 
 export function BeforeAfterReview({
@@ -43,6 +44,7 @@ export function BeforeAfterReview({
   onReset,
   onClose,
   onExport,
+  onExportExcel,
 }: BeforeAfterReviewProps) {
   const [page, setPage] = useState(1);
   const [onlyChanged, setOnlyChanged] = useState(false);
@@ -125,8 +127,19 @@ export function BeforeAfterReview({
             className="h-8 gap-1.5 px-3.5 text-xs font-semibold bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white cursor-pointer shadow-2xs"
           >
             <Download className="h-3.5 w-3.5" />
-            <span>Download Cleaned Spreadsheet</span>
+            <span>Download CSV</span>
           </Button>
+
+          {onExportExcel && (
+            <Button
+              size="sm"
+              onClick={onExportExcel}
+              className="h-8 gap-1.5 px-3 text-xs font-semibold border border-[#2F8F6B]/40 bg-[#2F8F6B]/10 hover:bg-[#2F8F6B]/20 text-[#2F8F6B] cursor-pointer shadow-2xs"
+            >
+              <Download className="h-3.5 w-3.5" />
+              <span>Excel (.xlsx)</span>
+            </Button>
+          )}
 
           <Button
             variant="outline"

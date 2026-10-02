@@ -5,6 +5,7 @@ export interface DetectedIssue {
   description: string;
   count: number;
   column?: string;
+  affectedRowIndices?: number[];
   suggestedAction: string;
   severity: 'high' | 'medium' | 'low';
 }
@@ -29,6 +30,30 @@ export interface FuzzyDuplicateCandidate {
   confidence: 'high' | 'medium';
 }
 
+export interface ColumnProfile {
+  columnName: string;
+  inferredType: 'text' | 'number' | 'id' | 'date' | 'boolean' | 'email' | 'phone';
+  typeConfidence: number; // 0-100
+  completenessScore: number; // 0-100
+  validityScore: number; // 0-100
+  uniquenessScore: number; // 0-100
+  columnScore: number; // 0-100
+  emptyCount: number;
+  invalidCount: number;
+  duplicateCount: number;
+  totalCount: number;
+  sampleValues: string[];
+  issues: string[];
+}
+
+export interface QualityDimensions {
+  completeness: number; // 0-100
+  validity: number;     // 0-100
+  consistency: number;  // 0-100
+  uniqueness: number;   // 0-100
+  overall: number;      // 0-100
+}
+
 export interface DatasetAnalysis {
   totalRows: number;
   totalColumns: number;
@@ -42,6 +67,8 @@ export interface DatasetAnalysis {
   qualityScore: number;
   statusLabel: string;
   statusTone: 'clean' | 'review' | 'attention';
+  dimensions: QualityDimensions;
+  columnProfiles: ColumnProfile[];
   issues: DetectedIssue[];
   flags: AttentionFlag[];
   fuzzyDuplicates: FuzzyDuplicateCandidate[];
@@ -52,6 +79,7 @@ export function inferColumnType(
   headerName = ''
 ): {
   type: 'text' | 'number' | 'id' | 'date' | 'boolean' | 'email' | 'phone';
+  confidence: number;
   empties: number;
   nulls: number;
 } {
@@ -113,17 +141,30 @@ export function inferColumnType(
 
   // ID guardrail: Never convert leading-zero strings into pure numbers
   if (isIdHeader || hasLeadingZero) {
-    return { type: 'id', empties, nulls };
+    return { type: 'id', confidence: 98, empties, nulls };
   }
 
   let type: 'text' | 'number' | 'id' | 'date' | 'boolean' | 'email' | 'phone' = 'text';
-  if (isEmail) type = 'email';
-  else if (isPhone) type = 'phone';
-  else if (isNumeric) type = 'number';
-  else if (isBoolean) type = 'boolean';
-  else if (isDate) type = 'date';
+  let confidence = 90;
 
-  return { type, empties, nulls };
+  if (isEmail) {
+    type = 'email';
+    confidence = 98;
+  } else if (isPhone) {
+    type = 'phone';
+    confidence = 94;
+  } else if (isNumeric) {
+    type = 'number';
+    confidence = 95;
+  } else if (isBoolean) {
+    type = 'boolean';
+    confidence = 99;
+  } else if (isDate) {
+    type = 'date';
+    confidence = 91;
+  }
+
+  return { type, confidence, empties, nulls };
 }
 
 export function analyzeDataset(
@@ -132,6 +173,7 @@ export function analyzeDataset(
 ): DatasetAnalysis {
   const totalRows = rows.length;
   const totalColumns = headers.length;
+
   if (totalRows === 0 || totalColumns === 0) {
     return {
       totalRows: 0,
@@ -146,6 +188,14 @@ export function analyzeDataset(
       qualityScore: 100,
       statusLabel: 'No data',
       statusTone: 'clean',
+      dimensions: {
+        completeness: 100,
+        validity: 100,
+        consistency: 100,
+        uniqueness: 100,
+        overall: 100,
+      },
+      columnProfiles: [],
       issues: [],
       flags: [],
       fuzzyDuplicates: [],
@@ -167,37 +217,53 @@ export function analyzeDataset(
   // 1b. Detect normalized duplicates (identical after trim and lowercase)
   const rowNormalizedSignatures = new Set<string>();
   let normalizedDuplicateRows = 0;
-  for (const row of rows) {
+  const duplicateRowIndices: number[] = [];
+
+  rows.forEach((row, idx) => {
     const normSig = headers.map((h) => (row[h] ?? '').trim().toLowerCase()).join('||');
     if (rowNormalizedSignatures.has(normSig)) {
       normalizedDuplicateRows++;
+      duplicateRowIndices.push(idx);
     } else {
       rowNormalizedSignatures.add(normSig);
     }
-  }
+  });
 
   // 2. Detect empty cells vs explicit placeholder cells ('null', 'na', 'n/a', '-')
   let emptyCells = 0;
   let explicitPlaceholderCells = 0;
   let whitespaceIssuesCount = 0;
-  for (const row of rows) {
+  const emptyCellRowIndices: number[] = [];
+  const whitespaceRowIndices: number[] = [];
+
+  rows.forEach((row, idx) => {
+    let rowHasEmpty = false;
+    let rowHasWhitespace = false;
+
     for (const h of headers) {
       const raw = row[h] ?? '';
       const trimmed = raw.trim().toLowerCase();
       if (raw !== raw.trim() || /\s{2,}/.test(raw)) {
         whitespaceIssuesCount++;
+        rowHasWhitespace = true;
       }
       if (trimmed === '') {
         emptyCells++;
+        rowHasEmpty = true;
       } else if (trimmed === 'null' || trimmed === 'na' || trimmed === 'n/a' || trimmed === '-') {
         explicitPlaceholderCells++;
+        rowHasEmpty = true;
       }
     }
-  }
 
-  // 3. Detect inconsistent casing in text columns (e.g. "JOHN", "john", "John")
+    if (rowHasEmpty) emptyCellRowIndices.push(idx);
+    if (rowHasWhitespace) whitespaceRowIndices.push(idx);
+  });
+
+  // 3. Detect inconsistent casing in text columns
   let inconsistentCaseCount = 0;
   const casingIssuesByCol: Record<string, number> = {};
+  const casingRowIndices: number[] = [];
 
   for (const h of headers) {
     const isTextHeader = !/(id|date|phone|total|price|rating|votes|zip|code)/i.test(h);
@@ -208,9 +274,9 @@ export function analyzeDataset(
     let hasTitle = false;
     let colInconsistentRows = 0;
 
-    for (const row of rows) {
+    rows.forEach((row, idx) => {
       const val = (row[h] ?? '').trim();
-      if (val.length < 2 || !/[a-zA-Z]/.test(val)) continue;
+      if (val.length < 2 || !/[a-zA-Z]/.test(val)) return;
 
       const isAllUpper = val === val.toUpperCase() && val !== val.toLowerCase();
       const isAllLower = val === val.toLowerCase() && val !== val.toUpperCase();
@@ -222,8 +288,9 @@ export function analyzeDataset(
 
       if (isAllUpper || isAllLower) {
         colInconsistentRows++;
+        if (!casingRowIndices.includes(idx)) casingRowIndices.push(idx);
       }
-    }
+    });
 
     if ((hasUpper && hasLower) || (hasUpper && hasTitle) || (hasLower && hasTitle)) {
       casingIssuesByCol[h] = colInconsistentRows;
@@ -231,9 +298,10 @@ export function analyzeDataset(
     }
   }
 
-  // 4. Detect broken formats & generate flags ("Flag it. Don't guess.")
+  // 4. Detect broken formats & generate flags
   let brokenFormatsCount = 0;
   const flags: AttentionFlag[] = [];
+  const brokenFormatRowIndices: number[] = [];
 
   for (const h of headers) {
     const isPhoneCol = /(phone|tel|mobile)/i.test(h);
@@ -245,13 +313,14 @@ export function analyzeDataset(
     let sampleVal = '';
 
     if (isPhoneCol) {
-      for (const row of rows) {
+      rows.forEach((row, idx) => {
         const val = (row[h] ?? '').trim();
         if (val && !/^\+\d{10,14}$|^\(\d{3}\)\s\d{3}-\d{4}$/.test(val)) {
           colBrokenCount++;
           if (!sampleVal) sampleVal = val;
+          if (!brokenFormatRowIndices.includes(idx)) brokenFormatRowIndices.push(idx);
         }
-      }
+      });
       if (colBrokenCount > 0) {
         brokenFormatsCount += colBrokenCount;
         flags.push({
@@ -260,17 +329,18 @@ export function analyzeDataset(
           issue: 'Mixed phone formatting delimiters',
           affectedCount: colBrokenCount,
           sampleValue: sampleVal,
-          recommendation: 'Review phone normalization proposal before applying',
+          recommendation: 'Normalize to consistent phone number format',
         });
       }
     } else if (isAddressCol) {
-      for (const row of rows) {
+      rows.forEach((row, idx) => {
         const val = (row[h] ?? '').trim();
         if (val && (!/\b\d{5}\b/.test(val) || !val.includes(','))) {
           colBrokenCount++;
           if (!sampleVal) sampleVal = val;
+          if (!brokenFormatRowIndices.includes(idx)) brokenFormatRowIndices.push(idx);
         }
-      }
+      });
       if (colBrokenCount > 0) {
         brokenFormatsCount += colBrokenCount;
         flags.push({
@@ -283,13 +353,14 @@ export function analyzeDataset(
         });
       }
     } else if (isEmailCol) {
-      for (const row of rows) {
+      rows.forEach((row, idx) => {
         const val = (row[h] ?? '').trim();
         if (val && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) {
           colBrokenCount++;
           if (!sampleVal) sampleVal = val;
+          if (!brokenFormatRowIndices.includes(idx)) brokenFormatRowIndices.push(idx);
         }
-      }
+      });
       if (colBrokenCount > 0) {
         flags.push({
           id: `flag_email_${h}`,
@@ -320,10 +391,9 @@ export function analyzeDataset(
     }
   }
 
-  // 5. Detect potential fuzzy duplicates (Suggestions only — never silently delete!)
+  // 5. Detect potential fuzzy duplicates (Suggestions only)
   const fuzzyDuplicates: FuzzyDuplicateCandidate[] = [];
   const emailCol = headers.find((h) => /(email|mail)/i.test(h));
-  const nameCol = headers.find((h) => /(name|lead|customer)/i.test(h));
 
   if (emailCol) {
     const seenEmails: Record<string, number> = {};
@@ -349,17 +419,93 @@ export function analyzeDataset(
     }
   }
 
-  // Calculate overall score & honest status language
-  const totalCells = totalRows * totalColumns;
-  const issueSum =
-    normalizedDuplicateRows * totalColumns +
-    inconsistentCaseCount +
-    whitespaceIssuesCount +
-    brokenFormatsCount;
+  // 6. Compute Comprehensive Column Profiles (Quality Engine 2.0)
+  const columnProfiles: ColumnProfile[] = headers.map((col) => {
+    const colValues: string[] = [];
+    const sampleValues: string[] = [];
+    let emptyCount = 0;
+    let invalidCount = 0;
+    const seenSet = new Set<string>();
+    let duplicateCount = 0;
 
-  const qualityScore = Math.max(
-    0,
-    Math.min(100, Math.round(100 - (issueSum / Math.max(1, totalCells)) * 100))
+    for (let r = 0; r < Math.min(rows.length, 2000); r++) {
+      const val = (rows[r][col] ?? '').trim();
+      colValues.push(val);
+      if (sampleValues.length < 5 && val && !sampleValues.includes(val)) {
+        sampleValues.push(val);
+      }
+
+      if (!val || ['null', 'na', 'n/a', '-'].includes(val.toLowerCase())) {
+        emptyCount++;
+      } else {
+        const lower = val.toLowerCase();
+        if (seenSet.has(lower)) {
+          duplicateCount++;
+        } else {
+          seenSet.add(lower);
+        }
+      }
+    }
+
+    const { type, confidence } = inferColumnType(colValues, col);
+
+    // Check validity based on inferred type
+    if (type === 'email') {
+      colValues.forEach((v) => {
+        if (v && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) invalidCount++;
+      });
+    } else if (type === 'phone') {
+      colValues.forEach((v) => {
+        if (v && !/^\+\d{10,14}$|^\(\d{3}\)\s\d{3}-\d{4}$/.test(v)) invalidCount++;
+      });
+    }
+
+    const totalVals = Math.max(1, colValues.length);
+    const completenessScore = Math.round(((totalVals - emptyCount) / totalVals) * 100);
+    const validityScore = Math.round(((totalVals - invalidCount) / totalVals) * 100);
+    const uniquenessScore = Math.round(((seenSet.size) / Math.max(1, totalVals - emptyCount)) * 100);
+
+    const issues: string[] = [];
+    if (emptyCount > 0) issues.push(`${emptyCount} missing values`);
+    if (invalidCount > 0) issues.push(`${invalidCount} format anomalies`);
+    if (duplicateCount > 0) issues.push(`${duplicateCount} repeated values`);
+
+    const columnScore = Math.round(
+      completenessScore * 0.4 + validityScore * 0.4 + (issues.length === 0 ? 20 : 10)
+    );
+
+    return {
+      columnName: col,
+      inferredType: type,
+      typeConfidence: confidence,
+      completenessScore,
+      validityScore,
+      uniquenessScore,
+      columnScore,
+      emptyCount,
+      invalidCount,
+      duplicateCount,
+      totalCount: totalVals,
+      sampleValues,
+      issues,
+    };
+  });
+
+  // 7. Calculate 4 Health Dimensions
+  const totalCells = totalRows * totalColumns;
+  const filledCells = totalCells - (emptyCells + explicitPlaceholderCells);
+  const completeness = Math.round((filledCells / Math.max(1, totalCells)) * 100);
+
+  const invalidFormatCells = brokenFormatsCount;
+  const validity = Math.max(0, Math.round(100 - (invalidFormatCells / Math.max(1, totalCells)) * 100));
+
+  const consistencyErrors = inconsistentCaseCount + whitespaceIssuesCount;
+  const consistency = Math.max(0, Math.round(100 - (consistencyErrors / Math.max(1, totalCells)) * 100));
+
+  const uniqueness = Math.max(0, Math.round(100 - (normalizedDuplicateRows / Math.max(1, totalRows)) * 100));
+
+  const overallQuality = Math.round(
+    completeness * 0.3 + validity * 0.3 + consistency * 0.2 + uniqueness * 0.2
   );
 
   const totalIssueCount =
@@ -379,7 +525,7 @@ export function analyzeDataset(
   const statusTone: 'clean' | 'review' | 'attention' =
     totalIssueCount === 0 ? 'clean' : flags.length > 0 ? 'attention' : 'review';
 
-  // Generate structured issue blocks
+  // 8. Generate structured issue blocks with affected row indices
   const issues: DetectedIssue[] = [];
 
   if (normalizedDuplicateRows > 0) {
@@ -389,6 +535,7 @@ export function analyzeDataset(
       title: `${normalizedDuplicateRows} duplicate ${normalizedDuplicateRows === 1 ? 'record' : 'records'} detected`,
       description: 'Identical records across columns that inflate counts and skew metrics.',
       count: normalizedDuplicateRows,
+      affectedRowIndices: duplicateRowIndices,
       suggestedAction: 'Deduplicate Rows',
       severity: 'high',
     });
@@ -403,6 +550,7 @@ export function analyzeDataset(
       description: `Mixed uppercase, lowercase, and sentence casing detected (e.g. in ${topCol ? topCol[0] : 'names'}).`,
       count: inconsistentCaseCount,
       column: topCol ? topCol[0] : undefined,
+      affectedRowIndices: casingRowIndices,
       suggestedAction: 'Standardize to Title Case',
       severity: 'medium',
     });
@@ -415,6 +563,7 @@ export function analyzeDataset(
       title: `${whitespaceIssuesCount} cells with irregular whitespace`,
       description: 'Trailing tabs, leading spaces, or double spaces causing formula and lookup failures.',
       count: whitespaceIssuesCount,
+      affectedRowIndices: whitespaceRowIndices,
       suggestedAction: 'Trim Whitespace',
       severity: 'low',
     });
@@ -427,6 +576,7 @@ export function analyzeDataset(
       title: `${explicitPlaceholderCells} unstandardized missing markers`,
       description: 'Mixed placeholder notations like "null", "na", and "-" that can be standardized.',
       count: explicitPlaceholderCells,
+      affectedRowIndices: emptyCellRowIndices,
       suggestedAction: 'Standardize Placeholders to "—"',
       severity: 'low',
     });
@@ -439,6 +589,7 @@ export function analyzeDataset(
       title: `${brokenFormatsCount} unstandardized ${brokenFormatsCount === 1 ? 'format' : 'formats'}`,
       description: 'Phone numbers or street addresses written with mixed punctuation and missing elements.',
       count: brokenFormatsCount,
+      affectedRowIndices: brokenFormatRowIndices,
       suggestedAction: 'Review Format Normalization',
       severity: 'medium',
     });
@@ -454,9 +605,17 @@ export function analyzeDataset(
     inconsistentCaseCount,
     brokenFormatsCount,
     whitespaceIssuesCount,
-    qualityScore,
+    qualityScore: overallQuality,
     statusLabel,
     statusTone,
+    dimensions: {
+      completeness,
+      validity,
+      consistency,
+      uniqueness,
+      overall: overallQuality,
+    },
+    columnProfiles,
     issues,
     flags,
     fuzzyDuplicates,

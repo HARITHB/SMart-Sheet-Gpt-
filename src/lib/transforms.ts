@@ -1,3 +1,5 @@
+import { normalizeCanonicalValue } from '@/lib/canonicalDictionaries';
+
 export type TransformRule =
   | 'trim'
   | 'uppercase'
@@ -7,6 +9,9 @@ export type TransformRule =
   | 'extract_zip'
   | 'extract_email'
   | 'fill_missing'
+  | 'normalize_city'
+  | 'normalize_country'
+  | 'normalize_company'
   | 'sentiment';
 
 export const TRANSFORM_LABELS: Record<TransformRule, string> = {
@@ -14,10 +19,13 @@ export const TRANSFORM_LABELS: Record<TransformRule, string> = {
   uppercase: 'Uppercase',
   lowercase: 'Lowercase',
   titlecase: 'Title Case',
-  normalize_phone: 'Normalize Phone Number',
+  normalize_phone: 'Normalize Phone (E.164)',
   extract_zip: 'Extract US Zip Code',
   extract_email: 'Extract Email Address',
-  fill_missing: 'Fill Missing as "N/A"',
+  fill_missing: 'Fill Missing as "—"',
+  normalize_city: 'Standardize City (Canonical)',
+  normalize_country: 'Standardize Country (Canonical)',
+  normalize_company: 'Standardize Company Suffixes',
   sentiment: 'Sentiment Analysis',
 };
 
@@ -71,7 +79,7 @@ export function normalizePhoneNumber(str: string): string {
   return trimmed.replace(/\s+/g, ' ');
 }
 
-export function fillMissingPlaceholder(str: string, placeholder = 'N/A'): string {
+export function fillMissingPlaceholder(str: string, placeholder = '—'): string {
   if (!str) return placeholder;
   const lower = str.trim().toLowerCase();
   if (lower === '' || lower === 'null' || lower === 'na' || lower === 'n/a' || lower === '-' || lower === 'unknown') {
@@ -113,6 +121,15 @@ export function transformColumn(
         break;
       case 'fill_missing':
         transformed = fillMissingPlaceholder(value);
+        break;
+      case 'normalize_city':
+        transformed = normalizeCanonicalValue(value, 'city').normalized;
+        break;
+      case 'normalize_country':
+        transformed = normalizeCanonicalValue(value, 'country').normalized;
+        break;
+      case 'normalize_company':
+        transformed = normalizeCanonicalValue(value, 'company').normalized;
         break;
       default:
         break;

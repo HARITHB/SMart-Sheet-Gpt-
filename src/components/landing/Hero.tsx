@@ -51,6 +51,7 @@ export function Hero({ onOpenApp }: HeroProps) {
           <span>Supported:</span>
           <span className="px-1.5 py-0.5 rounded bg-[#E5E5DE]/60 text-[#202522] font-semibold">.CSV</span>
           <span className="px-1.5 py-0.5 rounded bg-[#E5E5DE]/60 text-[#202522] font-semibold">.TSV</span>
+          <span className="px-1.5 py-0.5 rounded bg-[#E5E5DE]/60 text-[#202522] font-semibold">.XLSX</span>
           <span>· Up to 100MB</span>
         </div>
 

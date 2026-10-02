@@ -7,8 +7,18 @@ import {
   Sparkles,
   SplitSquareVertical,
   Undo2,
-  FileText,
+  FileSpreadsheet,
+  Layers,
+  ChevronDown,
 } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
+} from '@/components/ui/dropdown-menu';
 import { TidyRowLogo } from '@/components/ui/TidyRowLogo';
 
 interface WorkspaceHeaderProps {
@@ -19,8 +29,10 @@ interface WorkspaceHeaderProps {
   onUndo?: () => void;
   canUndo?: boolean;
   onExport: () => void;
+  onExportExcel?: () => void;
   onExportChangeLog?: () => void;
   onOpenAiClean: () => void;
+  onOpenMerge?: () => void;
   showBeforeAfter: boolean;
   onToggleBeforeAfter: () => void;
   hasModifications: boolean;
@@ -34,8 +46,10 @@ export function WorkspaceHeader({
   onUndo,
   canUndo = false,
   onExport,
+  onExportExcel,
   onExportChangeLog,
   onOpenAiClean,
+  onOpenMerge,
   showBeforeAfter,
   onToggleBeforeAfter,
   hasModifications,
@@ -69,15 +83,15 @@ export function WorkspaceHeader({
             </span>
             <span>→</span>
             <span className={activeStep === 'understand' ? 'text-[#4D7CFE] font-bold' : ''}>
-              2. Understand & Review
+              2. Diagnose
             </span>
             <span>→</span>
             <span className={activeStep === 'clean' ? 'text-[#2F8F6B] font-bold' : ''}>
-              3. Clean
+              3. Review & Clean
             </span>
             <span>→</span>
             <span className={activeStep === 'verify' ? 'text-[#2F8F6B] font-bold' : ''}>
-              4. Verify & Download
+              4. Destination Ready
             </span>
           </div>
         </div>
@@ -96,6 +110,19 @@ export function WorkspaceHeader({
                 >
                   <Undo2 className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">Undo</span>
+                </Button>
+              )}
+
+              {onOpenMerge && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onOpenMerge}
+                  className="h-8 gap-1.5 px-2.5 text-xs font-sans border-[#E5E5DE] bg-white text-[#202522] hover:bg-[#F0EEE6] cursor-pointer"
+                  title="Merge a secondary dataset into master"
+                >
+                  <Layers className="h-3.5 w-3.5 text-[#202522]/70" />
+                  <span className="hidden md:inline">Merge Dataset</span>
                 </Button>
               )}
 
@@ -134,14 +161,50 @@ export function WorkspaceHeader({
                 <span>Create Plan (AI-assisted)</span>
               </Button>
 
-              <Button
-                size="sm"
-                onClick={onExport}
-                className="h-8 gap-1.5 px-3.5 text-xs font-sans font-semibold bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white cursor-pointer shadow-2xs"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Download Cleaned</span>
-              </Button>
+              {/* Export Dropdown (CSV / Excel XLSX / Change Log) */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    className="h-8 gap-1.5 px-3.5 text-xs font-sans font-semibold bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white cursor-pointer shadow-2xs"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Download</span>
+                    <ChevronDown className="h-3 w-3 opacity-70" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56 bg-white border border-[#E5E5DE] shadow-lg z-50">
+                  <DropdownMenuLabel className="text-xs font-mono text-[#202522]/60">
+                    Export Formats
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator className="bg-[#E5E5DE]" />
+                  <DropdownMenuItem
+                    onClick={onExport}
+                    className="gap-2 text-xs font-sans cursor-pointer hover:bg-[#F7F5EF]"
+                  >
+                    <Download className="h-3.5 w-3.5 text-[#2F8F6B]" />
+                    <span>Cleaned CSV (.csv)</span>
+                  </DropdownMenuItem>
+                  {onExportExcel && (
+                    <DropdownMenuItem
+                      onClick={onExportExcel}
+                      className="gap-2 text-xs font-sans cursor-pointer hover:bg-[#F7F5EF]"
+                    >
+                      <FileSpreadsheet className="h-3.5 w-3.5 text-[#2F8F6B]" />
+                      <span>Cleaned Excel (.xlsx)</span>
+                    </DropdownMenuItem>
+                  )}
+                  {onExportChangeLog && (
+                    <DropdownMenuItem
+                      onClick={onExportChangeLog}
+                      className="gap-2 text-xs font-sans cursor-pointer hover:bg-[#F7F5EF]"
+                    >
+                      <Download className="h-3.5 w-3.5 text-[#4D7CFE]" />
+                      <span>Change Log Audit (.csv)</span>
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </>
           )}
         </div>

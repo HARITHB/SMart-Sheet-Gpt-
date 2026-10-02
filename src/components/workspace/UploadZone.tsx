@@ -64,7 +64,7 @@ export function UploadZone({
         <input
           ref={inputRef}
           type="file"
-          accept=".csv,.tsv"
+          accept=".csv,.tsv,.xlsx,.xls"
           className="hidden"
           onChange={(e) => {
             const file = e.target.files?.[0];
@@ -85,13 +85,13 @@ export function UploadZone({
         </div>
 
         <p className="text-base font-semibold text-[#202522] font-sans">
-          {isDragging ? 'Drop your spreadsheet here' : 'Drag & drop your CSV or TSV file'}
+          {isDragging ? 'Drop your spreadsheet here' : 'Drag & drop your CSV, TSV, or Excel (.xlsx) file'}
         </p>
         <p className="mt-1 text-xs text-[#202522]/60 font-sans">
           or <span className="font-semibold text-[#2F8F6B] hover:underline">browse files</span> from your device
         </p>
         <p className="mt-3 text-[11px] font-mono text-[#202522]/50">
-          Supports .csv, .tsv up to 100MB
+          Supports .csv, .tsv, .xlsx up to 100MB
         </p>
 
         {isParsing && (
