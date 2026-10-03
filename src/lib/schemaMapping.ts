@@ -121,6 +121,74 @@ export const ECOMMERCE_TARGET_SCHEMA: TargetSchema = {
   ],
 };
 
+export interface SchemaMappingCollision {
+  targetKey: string;
+  sourceColumns: string[];
+  message: string;
+}
+
+export interface SchemaMappingValidation {
+  isValid: boolean;
+  collisions: SchemaMappingCollision[];
+  missingRequired: {
+    targetKey: string;
+    label: string;
+  }[];
+  warnings: string[];
+}
+
+/**
+ * Validates proposed schema mappings to prevent silent data overwrites and collisions.
+ */
+export function validateSchemaMapping(
+  mapping: Record<string, string>,
+  targetSchema?: TargetSchema
+): SchemaMappingValidation {
+  const collisions: SchemaMappingCollision[] = [];
+  const warnings: string[] = [];
+  const missingRequired: { targetKey: string; label: string }[] = [];
+
+  // 1. Detect multiple source columns mapped to the same target field (collision)
+  const targetToSources = new Map<string, string[]>();
+  for (const [src, tgt] of Object.entries(mapping)) {
+    if (!tgt || tgt === src) continue; // Unmapped / preserved column
+    const existing = targetToSources.get(tgt) || [];
+    existing.push(src);
+    targetToSources.set(tgt, existing);
+  }
+
+  targetToSources.forEach((sources, targetKey) => {
+    if (sources.length > 1) {
+      collisions.push({
+        targetKey,
+        sourceColumns: sources,
+        message: `Multiple source columns (${sources.map((s) => `"${s}"`).join(', ')}) are mapped to the same destination field "${targetKey}". This would cause silent data overwrites.`,
+      });
+    }
+  });
+
+  // 2. Detect missing required fields from the target schema
+  if (targetSchema) {
+    const mappedTargets = new Set(Object.values(mapping));
+    for (const field of targetSchema.fields) {
+      if (field.required && !mappedTargets.has(field.key)) {
+        missingRequired.push({
+          targetKey: field.key,
+          label: field.label,
+        });
+        warnings.push(`Required destination field "${field.label}" (${field.key}) has no mapped source column.`);
+      }
+    }
+  }
+
+  return {
+    isValid: collisions.length === 0,
+    collisions,
+    missingRequired,
+    warnings,
+  };
+}
+
 export function suggestSchemaMapping(
   sourceHeaders: string[],
   targetSchema: TargetSchema
@@ -129,6 +197,7 @@ export function suggestSchemaMapping(
   const mappedTargets = new Set<string>();
 
   for (const src of sourceHeaders) {
+    if (src === '_tr_id') continue;
     const trimmed = src.trim();
     let bestMatch: SchemaField | null = null;
 
@@ -156,23 +225,36 @@ export function suggestSchemaMapping(
   return mapping;
 }
 
-export function applySchemaMapping(
-  rows: Record<string, string>[],
-  mapping: Record<string, string>
+export function applySchemaMapping<T extends Record<string, string>>(
+  rows: T[],
+  mapping: Record<string, string>,
+  targetSchema?: TargetSchema
 ): {
   newHeaders: string[];
-  newRows: Record<string, string>[];
+  newRows: T[];
 } {
-  const originalHeaders = Object.keys(mapping);
+  // Validate mapping before applying to guarantee no silent data overwrites occur
+  const validation = validateSchemaMapping(mapping, targetSchema);
+  if (!validation.isValid) {
+    throw new Error(
+      `Schema mapping collision blocked: ${validation.collisions.map((c) => c.message).join('; ')}`
+    );
+  }
+
+  const originalHeaders = Object.keys(mapping).filter((h) => h !== '_tr_id');
   const newHeaders = originalHeaders.map((h) => mapping[h] || h);
 
   const newRows = rows.map((row) => {
-    const updated: Record<string, string> = {};
+    const updated: any = {};
+    // Preserve stable row ID
+    if ((row as any)._tr_id) {
+      updated._tr_id = (row as any)._tr_id;
+    }
     for (const oldHeader of originalHeaders) {
       const newHeader = mapping[oldHeader] || oldHeader;
       updated[newHeader] = row[oldHeader] ?? '';
     }
-    return updated;
+    return updated as T;
   });
 
   return { newHeaders, newRows };

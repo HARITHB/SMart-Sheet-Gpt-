@@ -95,6 +95,25 @@ import {
   type DestinationPack,
 } from '@/lib/destinationReadiness';
 import type { MergeResult } from '@/lib/datasetMerge';
+import {
+  type DatasetRow,
+  type DatasetVersion,
+  type CleaningOperation,
+} from '@/lib/core/types';
+import { attachRowIds, stripRowIds, sanitizeHeaders } from '@/lib/core/rowId';
+import {
+  createInitialVersion,
+  executeTransactionalRun,
+  VersionManager,
+} from '@/lib/core/transaction';
+import {
+  validateDatasetInvariants,
+  validateAiCleanResponse,
+  validateAiSentimentResponse,
+} from '@/lib/core/invariants';
+import { generateValidatedCsvExport } from '@/lib/core/exportValidator';
+import { validatePostClean, type PostCleanValidationResult } from '@/lib/core/postCleanValidator';
+import { executeRecipe, type CleaningRecipe } from '@/lib/core/recipes';
 
 // Landing Page Components
 import { Navbar } from '@/components/landing/Navbar';
@@ -118,6 +137,13 @@ import { SchemaMappingDialog } from '@/components/workspace/SchemaMappingDialog'
 import { DataHealthReport } from '@/components/workspace/DataHealthReport';
 import { DestinationReadinessCard } from '@/components/workspace/DestinationReadinessCard';
 import { MultiFileMergeDialog } from '@/components/workspace/MultiFileMergeDialog';
+import { VersionHistoryModal } from '@/components/workspace/VersionHistoryModal';
+import { SaasFoundationBar } from '@/components/workspace/SaasFoundationBar';
+import { authService, type AuthSession } from '@/lib/saas/auth';
+import { sessionRecoveryService, type SessionCheckpoint } from '@/lib/saas/sessionRecovery';
+import { sharedCleaningEngine } from '@/lib/saas/sharedEngine';
+import { sanitizeDatasetRows } from '@/lib/saas/security';
+import { meteringService } from '@/lib/saas/metering';
 
 interface CsvData {
   fileName: string;
@@ -214,8 +240,9 @@ export default function App() {
   const [showBeforeAfter, setShowBeforeAfter] = useState(false);
   const [hasAppliedCleanups, setHasAppliedCleanups] = useState(false);
 
-  // Undo History Stack
-  const [history, setHistory] = useState<Record<string, string>[][]>([]);
+  // Undo History & Version Management (P0.1, P0.5)
+  const versionManagerRef = useRef<VersionManager>(new VersionManager());
+  const [canUndo, setCanUndo] = useState(false);
 
   // Saved Workflows
   const [savedWorkflows, setSavedWorkflows] = useState<CleaningWorkflow[]>([]);
@@ -262,23 +289,97 @@ export default function App() {
     setSavedWorkflows(loadSavedWorkflows());
   }, []);
 
-  const pushHistory = useCallback((currentRows: Record<string, string>[]) => {
-    setHistory((prev) => [...prev.slice(-15), currentRows.map((r) => ({ ...r }))]);
+  // SaaS Foundation State (Auth, Workspace, Session Recovery)
+  const [currentSession, setCurrentSession] = useState<AuthSession | null>(null);
+
+  useEffect(() => {
+    authService.getCurrentSession().then(setCurrentSession);
   }, []);
 
-  const handleUndo = useCallback(() => {
-    if (history.length === 0 || !csvData) return;
-    const previousState = history[history.length - 1];
-    setHistory((prev) => prev.slice(0, prev.length - 1));
-    setCsvData((prev) => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        rows: previousState,
-        totalRows: previousState.length,
-      };
+  // Auto-checkpoint session on dataset changes
+  useEffect(() => {
+    if (csvData && versionManagerRef.current.getCurrentVersion()) {
+      sessionRecoveryService.scheduleCheckpoint({
+        workspaceId: currentSession?.workspaceId || 'ws_default',
+        fileName: csvData.fileName,
+        headers: csvData.headers,
+        rows: csvData.rows as any,
+        currentVersion: versionManagerRef.current.getCurrentVersion()!,
+        versions: versionManagerRef.current.getAllVersions(),
+        hasModifications: hasAppliedCleanups,
+        activeTab: 'plan',
+      });
+    }
+  }, [csvData, hasAppliedCleanups, currentSession]);
+
+  const handleRestoreSessionCheckpoint = useCallback((checkpoint: SessionCheckpoint) => {
+    const rawCleanRows = checkpoint.rows.map((r) => {
+      const copy = { ...r };
+      delete (copy as any)._tr_id;
+      return copy;
     });
-  }, [history, csvData]);
+    setCsvData({
+      fileName: checkpoint.fileName,
+      fileSize: 1024 * 10,
+      headers: checkpoint.headers,
+      rows: checkpoint.rows,
+      totalRows: checkpoint.rows.length,
+      errors: 0,
+    });
+    setOriginalRows(rawCleanRows);
+    setHasAppliedCleanups(checkpoint.hasModifications);
+    if (checkpoint.currentVersion) {
+      versionManagerRef.current = new VersionManager(checkpoint.currentVersion);
+      if (checkpoint.versions && checkpoint.versions.length > 1) {
+        checkpoint.versions.slice(1).forEach((v) => {
+          versionManagerRef.current.commit(v);
+        });
+      }
+      setCanUndo(versionManagerRef.current.canUndo());
+    }
+    setCurrentView('workspace');
+  }, []);
+
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false);
+
+  const handleUndo = useCallback(() => {
+    if (!versionManagerRef.current.canUndo() || !csvData) return;
+    const prevVersion = versionManagerRef.current.undo();
+    if (prevVersion) {
+      setCsvData({
+        ...csvData,
+        headers: prevVersion.headers,
+        rows: prevVersion.rows,
+        totalRows: prevVersion.rows.length,
+      });
+      setCanUndo(versionManagerRef.current.canUndo());
+    }
+  }, [csvData]);
+
+  const handleRestoreVersion = useCallback(
+    (versionNumber: number) => {
+      if (!csvData) return;
+      const restored = versionManagerRef.current.restoreVersion(
+        versionNumber,
+        `Restored from Version v${versionNumber}`
+      );
+      if (restored) {
+        setCsvData({
+          ...csvData,
+          headers: restored.headers,
+          rows: restored.rows,
+          totalRows: restored.rows.length,
+        });
+        setCanUndo(versionManagerRef.current.canUndo());
+        setHasAppliedCleanups(true);
+      }
+    },
+    [csvData]
+  );
+
+  const handleCompareVersions = useCallback((v1: number, v2: number) => {
+    return versionManagerRef.current.compareVersions(v1, v2);
+  }, []);
 
   const loadSampleDataset = useCallback((sampleName: string, csvContent: string) => {
     setParseError(null);
@@ -289,7 +390,6 @@ export default function App() {
     setSentimentErrors({});
     setShowBeforeAfter(false);
     setHasAppliedCleanups(false);
-    setHistory([]);
     setCurrentPage(1);
     setActiveIssueFilter(null);
     setMergeNotification(null);
@@ -298,19 +398,25 @@ export default function App() {
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
-        const headers = results.meta.fields ?? [];
-        const allRows = results.data;
+        const rawHeaders = results.meta.fields ?? [];
+        const cleanHeaders = sanitizeHeaders(rawHeaders);
+        const rowsWithIds = attachRowIds(results.data);
+
+        const initialVersion = createInitialVersion(sampleName, cleanHeaders, rowsWithIds);
+        versionManagerRef.current.init(initialVersion);
+        setCanUndo(false);
 
         setCsvData({
           fileName: sampleName,
           fileSize: csvContent.length,
-          headers,
-          rows: allRows,
-          totalRows: allRows.length,
+          headers: cleanHeaders,
+          rows: rowsWithIds,
+          totalRows: rowsWithIds.length,
           errors: results.errors.length,
         });
-        setOriginalRows(allRows.map((r) => ({ ...r })));
-        setBeforeAnalysis(analyzeDataset(headers, allRows));
+        // Original dataset remains completely immutable (P0.1)
+        setOriginalRows(initialVersion.rows.map((r) => ({ ...r })));
+        setBeforeAnalysis(analyzeDataset(cleanHeaders, rowsWithIds));
         setCurrentPage(1);
         setIsParsing(false);
         setCurrentView('workspace');
@@ -346,7 +452,6 @@ export default function App() {
     setSentimentErrors({});
     setShowBeforeAfter(false);
     setHasAppliedCleanups(false);
-    setHistory([]);
     setCurrentPage(1);
     setActiveIssueFilter(null);
     setMergeNotification(null);
@@ -359,16 +464,23 @@ export default function App() {
             setIsParsing(false);
             return;
           }
+
+          const cleanHeaders = sanitizeHeaders(parsed.headers);
+          const rowsWithIds = attachRowIds(parsed.rows);
+          const initialVersion = createInitialVersion(parsed.fileName, cleanHeaders, rowsWithIds);
+          versionManagerRef.current.init(initialVersion);
+          setCanUndo(false);
+
           setCsvData({
             fileName: parsed.fileName,
             fileSize: parsed.fileSize,
-            headers: parsed.headers,
-            rows: parsed.rows,
-            totalRows: parsed.rows.length,
+            headers: cleanHeaders,
+            rows: rowsWithIds,
+            totalRows: rowsWithIds.length,
             errors: 0,
           });
-          setOriginalRows(parsed.rows.map((r) => ({ ...r })));
-          setBeforeAnalysis(analyzeDataset(parsed.headers, parsed.rows));
+          setOriginalRows(initialVersion.rows.map((r) => ({ ...r })));
+          setBeforeAnalysis(analyzeDataset(cleanHeaders, rowsWithIds));
           setCurrentPage(1);
           setIsParsing(false);
           setCurrentView('workspace');
@@ -384,7 +496,8 @@ export default function App() {
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
-        const headers = results.meta.fields ?? [];
+        const rawHeaders = results.meta.fields ?? [];
+        const cleanHeaders = sanitizeHeaders(rawHeaders);
         const allRows = results.data;
 
         if (allRows.length === 0) {
@@ -393,16 +506,21 @@ export default function App() {
           return;
         }
 
+        const rowsWithIds = attachRowIds(allRows);
+        const initialVersion = createInitialVersion(file.name, cleanHeaders, rowsWithIds);
+        versionManagerRef.current.init(initialVersion);
+        setCanUndo(false);
+
         setCsvData({
           fileName: file.name,
           fileSize: file.size,
-          headers,
-          rows: allRows,
-          totalRows: allRows.length,
+          headers: cleanHeaders,
+          rows: rowsWithIds,
+          totalRows: rowsWithIds.length,
           errors: results.errors.length,
         });
-        setOriginalRows(allRows.map((r) => ({ ...r })));
-        setBeforeAnalysis(analyzeDataset(headers, allRows));
+        setOriginalRows(initialVersion.rows.map((r) => ({ ...r })));
+        setBeforeAnalysis(analyzeDataset(cleanHeaders, rowsWithIds));
         setCurrentPage(1);
         setIsParsing(false);
         setCurrentView('workspace');
@@ -445,47 +563,76 @@ export default function App() {
     setSentimentErrors({});
     setShowBeforeAfter(false);
     setHasAppliedCleanups(false);
-    setHistory([]);
+    setCanUndo(false);
     setCurrentPage(1);
     setActiveIssueFilter(null);
     setMergeNotification(null);
   }, []);
 
-  // Standard Transform on entire dataset
+  // Standard Transform on entire dataset (P0.2, P0.5 Transactional)
   const handleApplyTransform = useCallback(
-    (columnName: string, rule: TransformRule) => {
+    async (columnName: string, rule: TransformRule) => {
       if (!csvData) return;
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-      pushHistory(csvData.rows);
-      const updatedRows = transformColumn(csvData.rows, columnName, rule);
+      const op: CleaningOperation = {
+        operationId: `op_${rule}_${Date.now()}`,
+        type: rule as any,
+        targetColumns: [columnName],
+        reason: `Apply ${TRANSFORM_LABELS[rule] || rule} on "${columnName}"`,
+        source: 'deterministic',
+        confidence: 'high',
+        deterministic: true,
+        reviewRequired: false,
+      };
 
-      setAppliedTransforms((prev) => {
-        const current = prev[columnName] ?? [];
-        const next = current.includes(rule)
-          ? current.filter((r) => r !== rule)
-          : [...current, rule];
-        return { ...prev, [columnName]: next };
-      });
+      const result = await executeTransactionalRun(
+        currentVersion,
+        [op],
+        (candidateRows) => {
+          const updated = transformColumn(candidateRows, columnName, rule);
+          return { rows: updated, headers: csvData.headers };
+        },
+        { label: `${TRANSFORM_LABELS[rule] || rule} on ${columnName}` }
+      );
 
-      setCsvData((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          rows: updatedRows,
-        };
-      });
-      setHasAppliedCleanups(true);
+      if (result.success && result.newVersion) {
+        versionManagerRef.current.commit(result.newVersion, result.run);
+        setCanUndo(versionManagerRef.current.canUndo());
+        setAppliedTransforms((prev) => {
+          const current = prev[columnName] ?? [];
+          const next = current.includes(rule)
+            ? current.filter((r) => r !== rule)
+            : [...current, rule];
+          return { ...prev, [columnName]: next };
+        });
+        setCsvData({
+          ...csvData,
+          rows: result.newVersion.rows,
+          totalRows: result.newVersion.rows.length,
+        });
+        setHasAppliedCleanups(true);
+      } else {
+        setParseError(result.error || 'Transformation blocked by safety check');
+      }
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
-  // Full export CSV
+  // Full export CSV (P0.1: strips internal _tr_id; P1.8: validates export round-trip; P2A: formula sanitization & metering)
   const handleExportCsv = useCallback(() => {
     if (!csvData) return;
-    const csvString = Papa.unparse(csvData.rows, {
-      quotes: true,
-      header: true,
-    });
+    const sanitizedRows = sanitizeDatasetRows(csvData.rows, csvData.headers);
+    const { csvString, validation } = generateValidatedCsvExport(csvData.headers, sanitizedRows);
+    if (!validation.isValid) {
+      setParseError(`Export blocked by validation safety check: ${validation.errors.join('; ')}`);
+      return;
+    }
+    if (currentSession) {
+      meteringService.recordUsage(currentSession.workspaceId, currentSession.principal.id, 'export_count', 1).catch(() => {});
+    }
     const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -498,20 +645,27 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
-  }, [csvData]);
+  }, [csvData, currentSession]);
 
-  // Full export Excel (.xlsx)
+  // Full export Excel (.xlsx) (P0.1: strips internal _tr_id; P2A: formula sanitization & metering)
   const handleExportExcel = useCallback(() => {
     if (!csvData) return;
-    exportToExcel(csvData.fileName, csvData.rows);
-  }, [csvData]);
+    const sanitizedRows = sanitizeDatasetRows(csvData.rows, csvData.headers);
+    const cleanRows = stripRowIds(sanitizedRows);
+    if (currentSession) {
+      meteringService.recordUsage(currentSession.workspaceId, currentSession.principal.id, 'export_count', 1).catch(() => {});
+    }
+    exportToExcel(csvData.fileName, cleanRows);
+  }, [csvData, currentSession]);
 
-  // AI Sentiment in batches of 100 rows
+  // AI Sentiment in batches with transactional candidate buffer (P0.5, P0.8)
   const handleSentiment = useCallback(
     async (header: string) => {
       if (!csvData) return;
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-      pushHistory(csvData.rows);
       const total = csvData.rows.length;
       cancelProcessingRef.current = false;
       setSentimentErrors((prev) => ({ ...prev, [header]: null }));
@@ -526,18 +680,20 @@ export default function App() {
         status: 'running',
       });
 
-      const allRows = [...csvData.rows];
+      // 1. Transactional candidate buffer - committed state is NOT touched during batches!
+      const candidateRows: DatasetRow[] = csvData.rows.map((r) => ({ ...r } as DatasetRow));
       let processedCount = 0;
 
       try {
         for (let i = 0; i < total; i += AI_BATCH_SIZE) {
           if (cancelProcessingRef.current) {
             setAiProgress((prev) => ({ ...prev, status: 'cancelled' }));
-            break;
+            // Complete rollback - candidate copy is discarded!
+            return;
           }
 
           const batchEnd = Math.min(i + AI_BATCH_SIZE, total);
-          const batchSlice = allRows.slice(i, batchEnd);
+          const batchSlice = candidateRows.slice(i, batchEnd);
           const batchValues = batchSlice.map((r) => r[header] ?? '');
 
           const res = await fetch('/api/ai-sentiment', {
@@ -550,37 +706,68 @@ export default function App() {
           });
 
           const data = await res.json();
-
           if (!res.ok) {
             throw new Error(data.error || 'Failed to analyze sentiment batch');
           }
 
-          const sentiments: string[] = data.values ?? data.sentiments ?? [];
+          const sentimentVal = validateAiSentimentResponse(data, batchSlice.length);
+          if (!sentimentVal.valid || !sentimentVal.values) {
+            throw new Error(sentimentVal.error || 'Malformed AI sentiment response format');
+          }
+
           for (let j = 0; j < batchSlice.length; j++) {
             const rowIdx = i + j;
-            allRows[rowIdx] = {
-              ...allRows[rowIdx],
-              [header]: sentiments[j] || 'Neutral',
+            candidateRows[rowIdx] = {
+              ...candidateRows[rowIdx],
+              [header]: sentimentVal.values[j],
             };
           }
 
           processedCount = batchEnd;
-
-          setCsvData((prev) => {
-            if (!prev) return prev;
-            return {
-              ...prev,
-              rows: [...allRows],
-            };
-          });
-
           setAiProgress((prev) => ({
             ...prev,
             completedRows: processedCount,
           }));
         }
 
-        if (!cancelProcessingRef.current) {
+        if (cancelProcessingRef.current) {
+          setAiProgress((prev) => ({ ...prev, status: 'cancelled' }));
+          return;
+        }
+
+        // 2. Post-execution invariant validation
+        const validation = validateDatasetInvariants(currentVersion, candidateRows, csvData.headers);
+        if (!validation.valid) {
+          throw new Error(`Data safety invariant violation: ${validation.errors.join('; ')}`);
+        }
+
+        // 3. Commit new version transactionally
+        const runResult = await executeTransactionalRun(
+          currentVersion,
+          [
+            {
+              operationId: `op_sentiment_${Date.now()}`,
+              type: 'sentiment',
+              targetColumns: [header],
+              reason: `Analyze sentiment for "${header}"`,
+              source: 'ai',
+              confidence: 'high',
+              deterministic: false,
+              reviewRequired: false,
+            },
+          ],
+          () => ({ rows: candidateRows, headers: csvData.headers }),
+          { label: `Sentiment Analysis on ${header}` }
+        );
+
+        if (runResult.success && runResult.newVersion) {
+          versionManagerRef.current.commit(runResult.newVersion, runResult.run);
+          setCanUndo(versionManagerRef.current.canUndo());
+          setCsvData({
+            ...csvData,
+            rows: runResult.newVersion.rows,
+            totalRows: runResult.newVersion.rows.length,
+          });
           setAppliedTransforms((prev) => ({
             ...prev,
             [header]: [...(prev[header] ?? []), 'sentiment' as TransformRule],
@@ -592,6 +779,8 @@ export default function App() {
             completedRows: total,
           }));
           setHasAppliedCleanups(true);
+        } else {
+          throw new Error(runResult.error || 'Failed to commit transactional sentiment run');
         }
       } catch (err: any) {
         const errorMsg = formatErrorMessage(err?.message || 'Sentiment analysis failed');
@@ -608,7 +797,7 @@ export default function App() {
         setSentimentLoading((prev) => ({ ...prev, [header]: false }));
       }
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
   const openAiDialog = useCallback(() => {
@@ -631,10 +820,13 @@ export default function App() {
     });
   }, []);
 
+  // AI Clean with transactional candidate buffer (P0.3, P0.4, P0.5)
   const handleAiClean = useCallback(async () => {
     if (!csvData || !aiInstruction.trim() || aiSelectedColumns.size === 0) return;
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-    pushHistory(csvData.rows);
     const total = csvData.rows.length;
     const selectedCols = Array.from(aiSelectedColumns);
 
@@ -650,18 +842,20 @@ export default function App() {
       status: 'running',
     });
 
-    const allRows = [...csvData.rows];
+    // 1. Transactional candidate buffer - committed state is NOT touched during batches!
+    const candidateRows: DatasetRow[] = csvData.rows.map((r) => ({ ...r } as DatasetRow));
     let processedCount = 0;
 
     try {
       for (let i = 0; i < total; i += AI_BATCH_SIZE) {
         if (cancelProcessingRef.current) {
           setAiProgress((prev) => ({ ...prev, status: 'cancelled' }));
-          break;
+          // Discard candidate, do not commit
+          return;
         }
 
         const batchEnd = Math.min(i + AI_BATCH_SIZE, total);
-        const batchSlice = allRows.slice(i, batchEnd);
+        const batchSlice = candidateRows.slice(i, batchEnd);
 
         const columns = selectedCols.map((header) => ({
           header,
@@ -678,45 +872,69 @@ export default function App() {
         });
 
         const result = await res.json();
-
         if (!res.ok) {
           throw new Error(result.error || 'AI cleaning failed');
         }
 
-        const cleanedMap: Record<string, string[]> = {};
-        for (const col of result.columns) {
-          cleanedMap[col.header] = col.values;
+        const aiVal = validateAiCleanResponse(result, selectedCols, batchSlice.length);
+        if (!aiVal.valid || !aiVal.cleanedMap) {
+          throw new Error(aiVal.error || 'Malformed AI clean response format');
         }
 
         for (let j = 0; j < batchSlice.length; j++) {
           const rowIdx = i + j;
-          const updated = { ...allRows[rowIdx] };
+          const updated = { ...candidateRows[rowIdx] };
           for (const colHeader of selectedCols) {
-            const vals = cleanedMap[colHeader];
-            if (vals && vals[j] !== undefined) {
-              updated[colHeader] = String(vals[j]);
-            }
+            updated[colHeader] = aiVal.cleanedMap[colHeader][j];
           }
-          allRows[rowIdx] = updated;
+          candidateRows[rowIdx] = updated;
         }
 
         processedCount = batchEnd;
-
-        setCsvData((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            rows: [...allRows],
-          };
-        });
-
         setAiProgress((prev) => ({
           ...prev,
           completedRows: processedCount,
         }));
       }
 
-      if (!cancelProcessingRef.current) {
+      if (cancelProcessingRef.current) {
+        setAiProgress((prev) => ({ ...prev, status: 'cancelled' }));
+        return;
+      }
+
+      // 2. Invariant Validation before commit
+      const validation = validateDatasetInvariants(currentVersion, candidateRows, csvData.headers);
+      if (!validation.valid) {
+        throw new Error(`Data safety invariant violation: ${validation.errors.join('; ')}`);
+      }
+
+      // 3. Commit new version transactionally
+      const runResult = await executeTransactionalRun(
+        currentVersion,
+        [
+          {
+            operationId: `op_ai_${Date.now()}`,
+            type: 'ai_clean',
+            targetColumns: selectedCols,
+            reason: aiInstruction.trim(),
+            source: 'ai',
+            confidence: 'high',
+            deterministic: false,
+            reviewRequired: false,
+          },
+        ],
+        () => ({ rows: candidateRows, headers: csvData.headers }),
+        { label: `AI Clean: ${aiInstruction.trim().slice(0, 30)}` }
+      );
+
+      if (runResult.success && runResult.newVersion) {
+        versionManagerRef.current.commit(runResult.newVersion, runResult.run);
+        setCanUndo(versionManagerRef.current.canUndo());
+        setCsvData({
+          ...csvData,
+          rows: runResult.newVersion.rows,
+          totalRows: runResult.newVersion.rows.length,
+        });
         setAiAppliedCount((c) => c + 1);
         setAiProgress((prev) => ({
           ...prev,
@@ -724,6 +942,8 @@ export default function App() {
           completedRows: total,
         }));
         setHasAppliedCleanups(true);
+      } else {
+        throw new Error(runResult.error || 'Failed to commit transactional AI clean run');
       }
     } catch (err: any) {
       const errorMsg = formatErrorMessage(err?.message || 'AI cleaning failed');
@@ -734,7 +954,7 @@ export default function App() {
         errorMessage: errorMsg,
       }));
     }
-  }, [csvData, aiInstruction, aiSelectedColumns, pushHistory]);
+  }, [csvData, aiInstruction, aiSelectedColumns]);
 
   // Live Dataset Analysis via Data Quality Engine 2.0
   const analysis = useMemo<DatasetAnalysis>(() => {
@@ -774,193 +994,396 @@ export default function App() {
     return generateChangeLog(csvData.headers, originalRows, csvData.rows, 'TidyRow Standard Cleanup');
   }, [csvData?.headers, csvData?.rows, originalRows]);
 
-  // Live Clean Actions
-  const handleRemoveDuplicates = useCallback(() => {
-    if (!csvData) return;
-    pushHistory(csvData.rows);
-    const uniqueRows = deduplicateRows(csvData.headers, csvData.rows);
-    setCsvData((prev) => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        rows: uniqueRows,
-        totalRows: uniqueRows.length,
-      };
-    });
-    setHasAppliedCleanups(true);
-  }, [csvData, pushHistory]);
+  // Generate Post-Clean Invariant & Validation Report (P1.1)
+  const postCleanValidation = useMemo<PostCleanValidationResult | null>(() => {
+    if (!csvData || originalRows.length === 0) return null;
+    const v0 = versionManagerRef.current.getVersion(0);
+    const vCur = versionManagerRef.current.getCurrentVersion();
+    if (!v0 || !vCur) return null;
+    return validatePostClean(v0, vCur, []);
+  }, [csvData?.rows, csvData?.headers, originalRows]);
 
-  const handleStandardizeTitleCase = useCallback(() => {
+  // Live Clean Actions (P0.5 Transactional)
+  const handleRemoveDuplicates = useCallback(async () => {
     if (!csvData) return;
-    pushHistory(csvData.rows);
-    let updatedRows = [...csvData.rows];
-    for (const h of csvData.headers) {
-      const isText = !/(id|date|phone|total|price|rating|votes|zip|code)/i.test(h);
-      if (isText) {
-        updatedRows = transformColumn(updatedRows, h, 'titlecase');
-        setAppliedTransforms((prev) => ({
-          ...prev,
-          [h]: Array.from(new Set([...(prev[h] ?? []), 'titlecase'])),
-        }));
-      }
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+    const result = await executeTransactionalRun(
+      currentVersion,
+      [
+        {
+          operationId: `op_dedup_${Date.now()}`,
+          type: 'deduplicate',
+          targetColumns: csvData.headers,
+          reason: 'Remove duplicate rows',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+      ],
+      (candidateRows) => {
+        const uniqueRows = deduplicateRows(csvData.headers, candidateRows);
+        return { rows: uniqueRows, headers: csvData.headers };
+      },
+      { label: 'Remove Duplicate Rows' }
+    );
+
+    if (result.success && result.newVersion) {
+      versionManagerRef.current.commit(result.newVersion, result.run);
+      setCanUndo(versionManagerRef.current.canUndo());
+      setCsvData({
+        ...csvData,
+        rows: result.newVersion.rows,
+        totalRows: result.newVersion.rows.length,
+      });
+      setHasAppliedCleanups(true);
+    } else {
+      setParseError(result.error || 'Deduplication blocked by safety check');
     }
-    setCsvData((prev) => (prev ? { ...prev, rows: updatedRows } : prev));
-    setHasAppliedCleanups(true);
-  }, [csvData, pushHistory]);
+  }, [csvData]);
 
-  const handleTrimWhitespace = useCallback(() => {
+  const handleStandardizeTitleCase = useCallback(async () => {
     if (!csvData) return;
-    pushHistory(csvData.rows);
-    let updatedRows = [...csvData.rows];
-    for (const h of csvData.headers) {
-      updatedRows = transformColumn(updatedRows, h, 'trim');
-    }
-    setCsvData((prev) => (prev ? { ...prev, rows: updatedRows } : prev));
-    setHasAppliedCleanups(true);
-  }, [csvData, pushHistory]);
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-  const handleStandardizePlaceholders = useCallback(() => {
-    if (!csvData) return;
-    pushHistory(csvData.rows);
-    const updatedRows = csvData.rows.map((row) => {
-      const updated = { ...row };
-      for (const h of csvData.headers) {
-        const val = (updated[h] ?? '').trim().toLowerCase();
-        if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
-          updated[h] = '—';
+    const textHeaders = csvData.headers.filter(
+      (h) => !/(id|date|phone|total|price|rating|votes|zip|code)/i.test(h)
+    );
+
+    const ops: CleaningOperation[] = textHeaders.map((h) => ({
+      operationId: `op_titlecase_${h}_${Date.now()}`,
+      type: 'titlecase',
+      targetColumns: [h],
+      reason: `Standardize ${h} to Title Case`,
+      source: 'deterministic',
+      confidence: 'high',
+      deterministic: true,
+      reviewRequired: false,
+    }));
+
+    const result = await executeTransactionalRun(
+      currentVersion,
+      ops,
+      (candidateRows) => {
+        let updated = candidateRows;
+        for (const h of textHeaders) {
+          updated = transformColumn(updated, h, 'titlecase');
         }
-      }
-      return updated;
-    });
-    setCsvData((prev) => (prev ? { ...prev, rows: updatedRows } : prev));
-    setHasAppliedCleanups(true);
-  }, [csvData, pushHistory]);
+        return { rows: updated, headers: csvData.headers };
+      },
+      { label: 'Standardize Title Case' }
+    );
 
-  const handleApplyAllRecommended = useCallback(() => {
+    if (result.success && result.newVersion) {
+      versionManagerRef.current.commit(result.newVersion, result.run);
+      setCanUndo(versionManagerRef.current.canUndo());
+      setCsvData({
+        ...csvData,
+        rows: result.newVersion.rows,
+        totalRows: result.newVersion.rows.length,
+      });
+      setHasAppliedCleanups(true);
+    } else {
+      setParseError(result.error || 'Title casing blocked by safety check');
+    }
+  }, [csvData]);
+
+  const handleTrimWhitespace = useCallback(async () => {
     if (!csvData) return;
-    pushHistory(csvData.rows);
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-    // 1. Trim whitespace
-    let processedRows = csvData.rows.map((row) => {
-      const updated = { ...row };
-      for (const h of csvData.headers) {
-        updated[h] = (updated[h] ?? '').trim().replace(/\s+/g, ' ');
-      }
-      return updated;
-    });
-
-    // 2. Deduplicate exact and normalized duplicate rows
-    processedRows = deduplicateRows(csvData.headers, processedRows);
-
-    // 3. Standardize Title Case on text columns
-    for (const h of csvData.headers) {
-      const isText = !/(id|date|phone|total|price|rating|votes|zip|code)/i.test(h);
-      if (isText) {
-        processedRows = transformColumn(processedRows, h, 'titlecase');
-        setAppliedTransforms((prev) => ({
-          ...prev,
-          [h]: Array.from(new Set([...(prev[h] ?? []), 'titlecase'])),
-        }));
-      }
-    }
-
-    // 4. Standardize canonical city/state variations
-    for (const h of csvData.headers) {
-      if (/(city|location|town)/i.test(h)) {
-        processedRows = transformColumn(processedRows, h, 'normalize_city');
-      } else if (/(country|nation)/i.test(h)) {
-        processedRows = transformColumn(processedRows, h, 'normalize_country');
-      }
-    }
-
-    setCsvData((prev) => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        rows: processedRows,
-        totalRows: processedRows.length,
-      };
-    });
-    setHasAppliedCleanups(true);
-    setShowBeforeAfter(true);
-  }, [csvData, pushHistory]);
-
-  // Execute an arbitrary structured plan
-  const handleExecutePlan = useCallback(
-    async (steps: CleaningStep[]) => {
-      if (!csvData || steps.length === 0) return;
-      pushHistory(csvData.rows);
-
-      let workingRows = [...csvData.rows];
-
-      for (const step of steps) {
-        if (!step.enabled) continue;
-
-        switch (step.action) {
-          case 'trim':
-            for (const h of csvData.headers) {
-              workingRows = transformColumn(workingRows, h, 'trim');
-            }
-            break;
-          case 'deduplicate':
-            workingRows = deduplicateRows(csvData.headers, workingRows);
-            break;
-          case 'titlecase':
-            if (step.columns && step.columns.length > 0) {
-              for (const col of step.columns) {
-                workingRows = transformColumn(workingRows, col, 'titlecase');
-              }
-            } else if (step.column) {
-              workingRows = transformColumn(workingRows, step.column, 'titlecase');
-            } else {
-              for (const h of csvData.headers) {
-                if (!/(id|date|phone|total|price|zip|code)/i.test(h)) {
-                  workingRows = transformColumn(workingRows, h, 'titlecase');
-                }
-              }
-            }
-            break;
-          case 'normalize_phone':
-            const phoneCols = step.columns || (step.column ? [step.column] : csvData.headers.filter((h) => /(phone|tel|mobile)/i.test(h)));
-            for (const col of phoneCols) {
-              workingRows = transformColumn(workingRows, col, 'normalize_phone');
-            }
-            break;
-          case 'extract_zip':
-            const addrCols = step.columns || (step.column ? [step.column] : csvData.headers.filter((h) => /(addr|street)/i.test(h)));
-            for (const col of addrCols) {
-              workingRows = transformColumn(workingRows, col, 'extract_zip');
-            }
-            break;
-          case 'fill_missing':
-            workingRows = workingRows.map((row) => {
-              const updated = { ...row };
-              for (const h of csvData.headers) {
-                const val = (updated[h] ?? '').trim().toLowerCase();
-                if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
-                  updated[h] = '—';
-                }
-              }
-              return updated;
-            });
-            break;
-          default:
-            break;
+    const result = await executeTransactionalRun(
+      currentVersion,
+      [
+        {
+          operationId: `op_trim_${Date.now()}`,
+          type: 'trim',
+          targetColumns: csvData.headers,
+          reason: 'Trim whitespace across all columns',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+      ],
+      (candidateRows) => {
+        let updated = candidateRows;
+        for (const h of csvData.headers) {
+          updated = transformColumn(updated, h, 'trim');
         }
-      }
+        return { rows: updated, headers: csvData.headers };
+      },
+      { label: 'Trim Whitespace' }
+    );
 
-      setCsvData((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          rows: workingRows,
-          totalRows: workingRows.length,
-        };
+    if (result.success && result.newVersion) {
+      versionManagerRef.current.commit(result.newVersion, result.run);
+      setCanUndo(versionManagerRef.current.canUndo());
+      setCsvData({
+        ...csvData,
+        rows: result.newVersion.rows,
+        totalRows: result.newVersion.rows.length,
+      });
+      setHasAppliedCleanups(true);
+    } else {
+      setParseError(result.error || 'Trimming blocked by safety check');
+    }
+  }, [csvData]);
+
+  const handleStandardizePlaceholders = useCallback(async () => {
+    if (!csvData) return;
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+    const result = await executeTransactionalRun(
+      currentVersion,
+      [
+        {
+          operationId: `op_fill_${Date.now()}`,
+          type: 'fill_missing',
+          targetColumns: csvData.headers,
+          reason: 'Fill missing/placeholder values with "—"',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+      ],
+      (candidateRows) => {
+        const updated = candidateRows.map((row) => {
+          const rowCopy = { ...row };
+          for (const h of csvData.headers) {
+            const val = (rowCopy[h] ?? '').trim().toLowerCase();
+            if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
+              rowCopy[h] = '—';
+            }
+          }
+          return rowCopy;
+        });
+        return { rows: updated, headers: csvData.headers };
+      },
+      { label: 'Standardize Placeholders' }
+    );
+
+    if (result.success && result.newVersion) {
+      versionManagerRef.current.commit(result.newVersion, result.run);
+      setCanUndo(versionManagerRef.current.canUndo());
+      setCsvData({
+        ...csvData,
+        rows: result.newVersion.rows,
+        totalRows: result.newVersion.rows.length,
+      });
+      setHasAppliedCleanups(true);
+    } else {
+      setParseError(result.error || 'Placeholder standardization blocked by safety check');
+    }
+  }, [csvData]);
+
+  const handleApplyAllRecommended = useCallback(async () => {
+    if (!csvData) return;
+    const currentVersion =
+      versionManagerRef.current.getCurrentVersion() ||
+      createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+    const textHeaders = csvData.headers.filter(
+      (h) => !/(id|date|phone|total|price|rating|votes|zip|code)/i.test(h)
+    );
+
+    const result = await executeTransactionalRun(
+      currentVersion,
+      [
+        {
+          operationId: `op_rec_trim_${Date.now()}`,
+          type: 'trim',
+          targetColumns: csvData.headers,
+          reason: 'Trim whitespace across all columns',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+        {
+          operationId: `op_rec_dedup_${Date.now()}`,
+          type: 'deduplicate',
+          targetColumns: csvData.headers,
+          reason: 'Remove duplicate rows',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+        {
+          operationId: `op_rec_titlecase_${Date.now()}`,
+          type: 'titlecase',
+          targetColumns: textHeaders,
+          reason: 'Standardize text columns to Title Case',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
+        },
+      ],
+      (candidateRows) => {
+        // 1. Trim whitespace
+        let processedRows = candidateRows.map((row) => {
+          const updated = { ...row };
+          for (const h of csvData.headers) {
+            updated[h] = (updated[h] ?? '').trim().replace(/\s+/g, ' ');
+          }
+          return updated;
+        });
+
+        // 2. Deduplicate exact and normalized duplicate rows (preserves stable _tr_id)
+        processedRows = deduplicateRows(csvData.headers, processedRows);
+
+        // 3. Standardize Title Case on text columns
+        for (const h of textHeaders) {
+          processedRows = transformColumn(processedRows, h, 'titlecase');
+        }
+
+        // 4. Standardize canonical city/state variations
+        for (const h of csvData.headers) {
+          if (/(city|location|town)/i.test(h)) {
+            processedRows = transformColumn(processedRows, h, 'normalize_city');
+          } else if (/(country|nation)/i.test(h)) {
+            processedRows = transformColumn(processedRows, h, 'normalize_country');
+          }
+        }
+
+        return { rows: processedRows, headers: csvData.headers };
+      },
+      { label: 'Apply Recommended Cleanups' }
+    );
+
+    if (result.success && result.newVersion) {
+      versionManagerRef.current.commit(result.newVersion, result.run);
+      setCanUndo(versionManagerRef.current.canUndo());
+      setCsvData({
+        ...csvData,
+        rows: result.newVersion.rows,
+        totalRows: result.newVersion.rows.length,
       });
       setHasAppliedCleanups(true);
       setShowBeforeAfter(true);
+    } else {
+      setParseError(result.error || 'Cleanups blocked by safety check');
+    }
+  }, [csvData]);
+
+  // Execute an arbitrary structured plan (P0.3, P0.5 Transactional)
+  const handleExecutePlan = useCallback(
+    async (steps: CleaningStep[]) => {
+      if (!csvData || steps.length === 0) return;
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+      const ops: CleaningOperation[] = steps
+        .filter((s) => s.enabled)
+        .map((s) => ({
+          operationId: s.id,
+          type: s.action as any,
+          targetColumns: s.columns || (s.column ? [s.column] : []),
+          reason: s.title,
+          source: s.deterministic ? 'deterministic' : 'ai',
+          confidence: s.confidence || 'high',
+          deterministic: s.deterministic ?? true,
+          reviewRequired: false,
+        }));
+
+      const result = await executeTransactionalRun(
+        currentVersion,
+        ops,
+        (candidateRows) => {
+          let workingRows = candidateRows;
+
+          for (const step of steps) {
+            if (!step.enabled) continue;
+
+            switch (step.action) {
+              case 'trim':
+                for (const h of csvData.headers) {
+                  workingRows = transformColumn(workingRows, h, 'trim');
+                }
+                break;
+              case 'deduplicate':
+                workingRows = deduplicateRows(csvData.headers, workingRows);
+                break;
+              case 'titlecase':
+                if (step.columns && step.columns.length > 0) {
+                  for (const col of step.columns) {
+                    workingRows = transformColumn(workingRows, col, 'titlecase');
+                  }
+                } else if (step.column) {
+                  workingRows = transformColumn(workingRows, step.column, 'titlecase');
+                } else {
+                  for (const h of csvData.headers) {
+                    if (!/(id|date|phone|total|price|zip|code)/i.test(h)) {
+                      workingRows = transformColumn(workingRows, h, 'titlecase');
+                    }
+                  }
+                }
+                break;
+              case 'normalize_phone':
+                const phoneCols =
+                  step.columns ||
+                  (step.column ? [step.column] : csvData.headers.filter((h) => /(phone|tel|mobile)/i.test(h)));
+                for (const col of phoneCols) {
+                  workingRows = transformColumn(workingRows, col, 'normalize_phone');
+                }
+                break;
+              case 'extract_zip':
+                const addrCols =
+                  step.columns ||
+                  (step.column ? [step.column] : csvData.headers.filter((h) => /(addr|street)/i.test(h)));
+                for (const col of addrCols) {
+                  workingRows = transformColumn(workingRows, col, 'extract_zip');
+                }
+                break;
+              case 'fill_missing':
+                workingRows = workingRows.map((row) => {
+                  const updated = { ...row };
+                  for (const h of csvData.headers) {
+                    const val = (updated[h] ?? '').trim().toLowerCase();
+                    if (val === 'null' || val === 'na' || val === 'n/a' || val === '-') {
+                      updated[h] = '—';
+                    }
+                  }
+                  return updated;
+                });
+                break;
+              default:
+                break;
+            }
+          }
+          return { rows: workingRows, headers: csvData.headers };
+        },
+        { label: 'Execute Cleaning Plan' }
+      );
+
+      if (result.success && result.newVersion) {
+        versionManagerRef.current.commit(result.newVersion, result.run);
+        setCanUndo(versionManagerRef.current.canUndo());
+        setCsvData({
+          ...csvData,
+          rows: result.newVersion.rows,
+          totalRows: result.newVersion.rows.length,
+        });
+        setHasAppliedCleanups(true);
+        setShowBeforeAfter(true);
+      } else {
+        setParseError(result.error || 'Plan execution blocked by safety check');
+      }
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
   // Apply a Repeatable Workflow
@@ -969,6 +1392,48 @@ export default function App() {
       handleExecutePlan(workflow.steps);
     },
     [handleExecutePlan]
+  );
+
+  // Apply a Standard Quality Recipe (Deterministic P1.5)
+  const handleApplyRecipe = useCallback(
+    async (recipe: CleaningRecipe) => {
+      if (currentSession?.principal.role === 'viewer') {
+        setParseError('Permission Denied: Viewer role is read-only and cannot mutate data.');
+        return;
+      }
+
+      if (!csvData) return;
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+      try {
+        const cleanResult = await sharedCleaningEngine.executeClean({
+          session: currentSession || (await authService.getCurrentSession())!,
+          baseVersion: currentVersion,
+          recipe,
+          options: { sanitizeFormulas: true, updateSessionCheckpoint: true },
+        });
+
+        if (cleanResult.success && cleanResult.newVersion) {
+          versionManagerRef.current.commit(cleanResult.newVersion, cleanResult.transaction.run);
+          setCanUndo(versionManagerRef.current.canUndo());
+          setCsvData({
+            ...csvData,
+            headers: cleanResult.newVersion.headers,
+            rows: cleanResult.newVersion.rows,
+            totalRows: cleanResult.newVersion.rows.length,
+          });
+          setHasAppliedCleanups(true);
+          setShowBeforeAfter(true);
+        } else {
+          setParseError(cleanResult.error || `Recipe "${recipe.name}" blocked by safety check`);
+        }
+      } catch (err: any) {
+        setParseError(err?.message || `Failed to execute recipe "${recipe.name}"`);
+      }
+    },
+    [csvData, currentSession]
   );
 
   // Save current plan as reusable workflow
@@ -985,91 +1450,180 @@ export default function App() {
     []
   );
 
-  // Apply Schema Mapping
+  // Apply Schema Mapping (P0.9 Collision Protected)
   const handleApplySchemaMapping = useCallback(
-    (mapping: Record<string, string>) => {
+    async (mapping: Record<string, string>) => {
       if (!csvData) return;
-      pushHistory(csvData.rows);
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-      const { newHeaders, newRows } = applySchemaMapping(csvData.rows, mapping);
-      setCsvData((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          headers: newHeaders,
-          rows: newRows,
+      try {
+        const { newHeaders, newRows } = applySchemaMapping(csvData.rows, mapping);
+
+        const op: CleaningOperation = {
+          operationId: `op_schema_${Date.now()}`,
+          type: 'schema_mapping',
+          targetColumns: newHeaders,
+          reason: 'Apply destination schema mapping',
+          source: 'deterministic',
+          confidence: 'high',
+          deterministic: true,
+          reviewRequired: false,
         };
-      });
-      setHasAppliedCleanups(true);
-      setShowBeforeAfter(true);
+
+        const result = await executeTransactionalRun(
+          currentVersion,
+          [op],
+          () => ({ rows: newRows as DatasetRow[], headers: newHeaders }),
+          { label: 'Destination Schema Mapping' }
+        );
+
+        if (result.success && result.newVersion) {
+          versionManagerRef.current.commit(result.newVersion, result.run);
+          setCanUndo(versionManagerRef.current.canUndo());
+          setCsvData({
+            ...csvData,
+            headers: result.newVersion.headers,
+            rows: result.newVersion.rows,
+            totalRows: result.newVersion.rows.length,
+          });
+          setHasAppliedCleanups(true);
+          setShowBeforeAfter(true);
+        } else {
+          setParseError(result.error || 'Schema mapping blocked by collision check');
+        }
+      } catch (err: any) {
+        setParseError(err.message || 'Schema mapping collision');
+      }
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
   // Apply Destination Readiness Fixes
   const handleApplyDestinationFixes = useCallback(
     async (pack: DestinationPack, mapping: Record<string, string>, steps: CleaningStep[]) => {
       if (!csvData) return;
-      pushHistory(csvData.rows);
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
 
-      const { newHeaders, newRows } = applySchemaMapping(csvData.rows, mapping);
-      let workingRows = [...newRows];
+      try {
+        const { newHeaders, newRows } = applySchemaMapping(csvData.rows, mapping);
 
-      for (const step of steps) {
-        if (!step.enabled) continue;
-        if (step.action === 'trim') {
-          for (const h of newHeaders) {
-            workingRows = transformColumn(workingRows, h, 'trim');
-          }
-        } else if (step.action === 'deduplicate') {
-          workingRows = deduplicateRows(newHeaders, workingRows);
-        } else if (step.action === 'titlecase') {
-          for (const h of newHeaders) {
-            if (/(name|firstname|lastname|fullname|title)/i.test(h)) {
-              workingRows = transformColumn(workingRows, h, 'titlecase');
+        const ops: CleaningOperation[] = [
+          {
+            operationId: `op_dest_schema_${Date.now()}`,
+            type: 'schema_mapping',
+            targetColumns: newHeaders,
+            reason: `Map columns to ${pack.name}`,
+            source: 'deterministic',
+            confidence: 'high',
+            deterministic: true,
+            reviewRequired: false,
+          },
+          ...steps.map((s) => ({
+            operationId: s.id,
+            type: s.action as any,
+            targetColumns: s.columns || (s.column ? [s.column] : []),
+            reason: s.title,
+            source: 'deterministic' as const,
+            confidence: 'high' as const,
+            deterministic: true,
+            reviewRequired: false,
+          })),
+        ];
+
+        const result = await executeTransactionalRun(
+          currentVersion,
+          ops,
+          (candidateRows) => {
+            let workingRows: DatasetRow[] = newRows as DatasetRow[];
+
+            for (const step of steps) {
+              if (!step.enabled) continue;
+              if (step.action === 'trim') {
+                for (const h of newHeaders) {
+                  workingRows = transformColumn(workingRows, h, 'trim');
+                }
+              } else if (step.action === 'deduplicate') {
+                workingRows = deduplicateRows(newHeaders, workingRows);
+              } else if (step.action === 'titlecase') {
+                for (const h of newHeaders) {
+                  if (/(name|firstname|lastname|fullname|title)/i.test(h)) {
+                    workingRows = transformColumn(workingRows, h, 'titlecase');
+                  }
+                }
+              } else if (step.action === 'normalize_phone') {
+                for (const h of newHeaders) {
+                  if (/(phone|mobile|tel)/i.test(h)) {
+                    workingRows = transformColumn(workingRows, h, 'normalize_phone');
+                  }
+                }
+              }
             }
-          }
-        } else if (step.action === 'normalize_phone') {
-          for (const h of newHeaders) {
-            if (/(phone|mobile|tel)/i.test(h)) {
-              workingRows = transformColumn(workingRows, h, 'normalize_phone');
-            }
-          }
+            return { rows: workingRows, headers: newHeaders };
+          },
+          { label: `Prepare for ${pack.systemName}` }
+        );
+
+        if (result.success && result.newVersion) {
+          versionManagerRef.current.commit(result.newVersion, result.run);
+          setCanUndo(versionManagerRef.current.canUndo());
+          setCsvData({
+            ...csvData,
+            headers: result.newVersion.headers,
+            rows: result.newVersion.rows,
+            totalRows: result.newVersion.rows.length,
+          });
+          setHasAppliedCleanups(true);
+          setShowBeforeAfter(true);
+        } else {
+          setParseError(result.error || 'Destination readiness blocked by collision or safety violation');
         }
+      } catch (err: any) {
+        setParseError(err.message || 'Destination preparation failed');
       }
-
-      setCsvData({
-        ...csvData,
-        headers: newHeaders,
-        rows: workingRows,
-        totalRows: workingRows.length,
-      });
-      setHasAppliedCleanups(true);
-      setShowBeforeAfter(true);
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
   // Multi-File Merge Complete
   const handleMergeComplete = useCallback(
     (result: MergeResult, secondaryFileName: string) => {
       if (!csvData) return;
-      pushHistory(csvData.rows);
+      const currentVersion =
+        versionManagerRef.current.getCurrentVersion() ||
+        createInitialVersion(csvData.fileName, csvData.headers, csvData.rows);
+
+      const mergedRowsWithIds = attachRowIds(result.mergedRows);
+      const newVersionNumber = currentVersion.versionNumber + 1;
+      const newVersion: DatasetVersion = {
+        versionId: `v${newVersionNumber}_${Date.now()}`,
+        versionNumber: newVersionNumber,
+        fileName: csvData.fileName,
+        headers: result.mergedHeaders,
+        rows: mergedRowsWithIds,
+        timestamp: new Date().toISOString(),
+        label: `Merged with ${secondaryFileName}`,
+      };
+
+      versionManagerRef.current.commit(newVersion);
+      setCanUndo(versionManagerRef.current.canUndo());
 
       setCsvData({
         ...csvData,
         headers: result.mergedHeaders,
-        rows: result.mergedRows,
-        totalRows: result.mergedRows.length,
+        rows: mergedRowsWithIds,
+        totalRows: mergedRowsWithIds.length,
       });
 
       setMergeNotification(
         `Merged "${secondaryFileName}": ${result.stats.matchedCount} records matched, ${result.stats.secondaryOnlyCount} new records appended, ${result.stats.conflictCount} conflicts resolved.`
       );
       setHasAppliedCleanups(true);
-      setShowBeforeAfter(true);
     },
-    [csvData, pushHistory]
+    [csvData]
   );
 
   const totalTransforms = useMemo(() => {
@@ -1113,9 +1667,9 @@ export default function App() {
   const hasModifications = useMemo(() => {
     if (!csvData || originalRows.length === 0) return false;
     if (csvData.rows.length !== originalRows.length) return true;
-    if (hasAppliedCleanups || totalTransforms > 0 || aiAppliedCount > 0 || history.length > 0) return true;
+    if (hasAppliedCleanups || totalTransforms > 0 || aiAppliedCount > 0 || canUndo) return true;
     return false;
-  }, [csvData, originalRows, hasAppliedCleanups, totalTransforms, aiAppliedCount, history]);
+  }, [csvData, originalRows, hasAppliedCleanups, totalTransforms, aiAppliedCount, canUndo]);
 
   // Render Landing View
   if (currentView === 'landing') {
@@ -1160,7 +1714,7 @@ export default function App() {
         onNavigateHome={() => setCurrentView('landing')}
         onReset={handleRemoveFile}
         onUndo={handleUndo}
-        canUndo={history.length > 0}
+        canUndo={canUndo}
         onExport={handleExportCsv}
         onExportExcel={handleExportExcel}
         onExportChangeLog={() => {
@@ -1168,9 +1722,18 @@ export default function App() {
         }}
         onOpenAiClean={openAiDialog}
         onOpenMerge={() => setMergeDialogOpen(true)}
+        onOpenVersionHistory={() => setVersionHistoryOpen(true)}
         showBeforeAfter={showBeforeAfter}
         onToggleBeforeAfter={() => setShowBeforeAfter((prev) => !prev)}
         hasModifications={hasModifications}
+      />
+
+      <SaasFoundationBar
+        currentSession={currentSession}
+        onSessionChange={setCurrentSession}
+        onRestoreSessionCheckpoint={handleRestoreSessionCheckpoint}
+        headers={csvData?.headers}
+        rows={csvData?.rows}
       />
 
       <main className="mx-auto max-w-[1720px] w-full px-4 sm:px-6 lg:px-8 py-6 flex-1 flex flex-col">
@@ -1219,6 +1782,9 @@ export default function App() {
             {/* Core Value: Data Quality Engine 2.0 & Health Report */}
             <DataHealthReport
               analysis={analysis}
+              totalRows={csvData.rows.length}
+              isSampled={csvData.rows.length > 5000}
+              sampleSize={Math.min(csvData.rows.length, 5000)}
               onFilterByIssue={(issueId) => {
                 setActiveIssueFilter(issueId);
                 setCurrentPage(1);
@@ -1235,6 +1801,7 @@ export default function App() {
               fileName={csvData.fileName}
               analysis={analysis}
               headers={csvData.headers}
+              rows={csvData.rows}
               onApplyAllRecommended={handleApplyAllRecommended}
               onRemoveDuplicates={handleRemoveDuplicates}
               onStandardizeTitleCase={handleStandardizeTitleCase}
@@ -1245,6 +1812,7 @@ export default function App() {
               onExecutePlan={handleExecutePlan}
               savedWorkflows={savedWorkflows}
               onApplyWorkflow={handleApplyWorkflow}
+              onApplyRecipe={handleApplyRecipe}
               onSaveCurrentAsWorkflow={handleSaveCurrentAsWorkflow}
               hasAppliedCleanups={hasAppliedCleanups}
             />
@@ -1259,8 +1827,10 @@ export default function App() {
                 beforeAnalysis={beforeAnalysis || undefined}
                 afterAnalysis={analysis}
                 changeLog={changeLog}
+                postCleanValidation={postCleanValidation}
                 onUndo={handleUndo}
                 onReset={handleRemoveFile}
+                onOpenVersionHistory={() => setVersionHistoryOpen(true)}
                 onClose={() => setShowBeforeAfter(false)}
                 onExport={handleExportCsv}
                 onExportExcel={handleExportExcel}
@@ -1285,9 +1855,9 @@ export default function App() {
                       <Filter className="h-2.5 w-2.5" /> Filtering {displayedRows.length} affected rows
                     </span>
                   )}
-                  {history.length > 0 && (
+                  {canUndo && (
                     <span className="font-mono text-[10px] text-[#2F8F6B] bg-[#2F8F6B]/10 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
-                      <Undo2 className="h-2.5 w-2.5" /> {history.length} undo step{history.length > 1 ? 's' : ''} available
+                      <Undo2 className="h-2.5 w-2.5" /> Version undo available
                     </span>
                   )}
                 </div>
@@ -1568,6 +2138,18 @@ export default function App() {
           onOpenChange={setSchemaMappingOpen}
           headers={csvData.headers}
           onApplyMapping={handleApplySchemaMapping}
+        />
+      )}
+
+      {/* Version History & Restore Modal */}
+      {csvData && (
+        <VersionHistoryModal
+          open={versionHistoryOpen}
+          onOpenChange={setVersionHistoryOpen}
+          versions={versionManagerRef.current.getAllVersions()}
+          currentVersionNumber={versionManagerRef.current.getCurrentVersion()?.versionNumber ?? 0}
+          onRestoreVersion={handleRestoreVersion}
+          onCompareVersions={handleCompareVersions}
         />
       )}
 

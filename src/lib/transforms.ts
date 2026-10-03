@@ -1,4 +1,5 @@
 import { normalizeCanonicalValue } from '@/lib/canonicalDictionaries';
+import { ID_COLUMN_PATTERN } from '@/lib/core/invariants';
 
 export type TransformRule =
   | 'trim'
@@ -88,11 +89,18 @@ export function fillMissingPlaceholder(str: string, placeholder = '—'): string
   return str;
 }
 
-export function transformColumn(
-  rows: Record<string, string>[],
+export function transformColumn<T extends Record<string, string>>(
+  rows: T[],
   columnName: string,
   rule: TransformRule
-): Record<string, string>[] {
+): T[] {
+  // Guard: Protect primary identifiers from casing modifications
+  const isIdColumn = ID_COLUMN_PATTERN.test(columnName);
+  if (isIdColumn && (rule === 'titlecase' || rule === 'lowercase' || rule === 'uppercase')) {
+    // Return rows unchanged to strictly protect identifier integrity
+    return rows;
+  }
+
   return rows.map((row) => {
     const value = row[columnName] ?? '';
     let transformed = value;

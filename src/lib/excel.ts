@@ -77,13 +77,21 @@ export async function parseExcelFile(file: File): Promise<ParsedSheetData> {
 
 /**
  * Exports data rows to a real Microsoft Excel (.xlsx) file.
+ * Automatically strips internal _tr_id tracking markers.
  */
 export function exportToExcel(
   fileName: string,
   rows: Record<string, string>[],
   sheetName = 'Cleaned Data'
 ): void {
-  const worksheet = XLSX.utils.json_to_sheet(rows);
+  // Strip internal _tr_id to prevent leak
+  const sanitizedRows = rows.map((r) => {
+    const copy = { ...r };
+    delete copy._tr_id;
+    return copy;
+  });
+
+  const worksheet = XLSX.utils.json_to_sheet(sanitizedRows);
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
 

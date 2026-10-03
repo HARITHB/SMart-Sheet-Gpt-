@@ -10,6 +10,7 @@ import {
   FileSpreadsheet,
   Layers,
   ChevronDown,
+  History,
 } from 'lucide-react';
 import {
   DropdownMenu,
@@ -33,6 +34,7 @@ interface WorkspaceHeaderProps {
   onExportChangeLog?: () => void;
   onOpenAiClean: () => void;
   onOpenMerge?: () => void;
+  onOpenVersionHistory?: () => void;
   showBeforeAfter: boolean;
   onToggleBeforeAfter: () => void;
   hasModifications: boolean;
@@ -50,6 +52,7 @@ export function WorkspaceHeader({
   onExportChangeLog,
   onOpenAiClean,
   onOpenMerge,
+  onOpenVersionHistory,
   showBeforeAfter,
   onToggleBeforeAfter,
   hasModifications,
@@ -110,6 +113,19 @@ export function WorkspaceHeader({
                 >
                   <Undo2 className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">Undo</span>
+                </Button>
+              )}
+
+              {onOpenVersionHistory && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onOpenVersionHistory}
+                  className="h-8 gap-1.5 px-2.5 text-xs font-sans border-[#E5E5DE] bg-white text-[#202522] hover:bg-[#F0EEE6] cursor-pointer"
+                  title="View immutable versions and restore history"
+                >
+                  <History className="h-3.5 w-3.5 text-[#4D7CFE]" />
+                  <span className="hidden sm:inline">History</span>
                 </Button>
               )}
 

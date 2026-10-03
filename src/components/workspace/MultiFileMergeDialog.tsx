@@ -109,21 +109,25 @@ export function MultiFileMergeDialog({
   const handleExecuteMerge = () => {
     if (!secondaryFile || !primaryKey || !secondaryKey) return;
 
-    const result = mergeDatasets(
-      primaryHeaders,
-      primaryRows,
-      secondaryFile.headers,
-      secondaryFile.rows,
-      {
-        primaryKey,
-        secondaryKey,
-        joinType,
-        conflictResolution,
-      }
-    );
+    try {
+      const result = mergeDatasets(
+        primaryHeaders,
+        primaryRows,
+        secondaryFile.headers,
+        secondaryFile.rows,
+        {
+          primaryKey,
+          secondaryKey,
+          joinType,
+          conflictResolution,
+        }
+      );
 
-    onMergeComplete(result, secondaryFile.fileName);
-    onOpenChange(false);
+      onMergeComplete(result, secondaryFile.fileName);
+      onOpenChange(false);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Dataset merge failed due to conflict');
+    }
   };
 
   return (

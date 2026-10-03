@@ -26,6 +26,9 @@ interface DataHealthReportProps {
   onFilterByIssue?: (issueId: string) => void;
   activeIssueFilter?: string | null;
   onClearIssueFilter?: () => void;
+  isSampled?: boolean;
+  sampleSize?: number;
+  totalRows?: number;
 }
 
 export function DataHealthReport({
@@ -34,6 +37,9 @@ export function DataHealthReport({
   onFilterByIssue,
   activeIssueFilter,
   onClearIssueFilter,
+  isSampled,
+  sampleSize,
+  totalRows,
 }: DataHealthReportProps) {
   const [selectedProfileColumn, setSelectedProfileColumn] = useState<ColumnProfile | null>(null);
 
@@ -67,9 +73,18 @@ export function DataHealthReport({
           <h2 className="text-lg font-bold text-[#202522] font-sans mt-0.5">
             Dataset Health & Column Profiling
           </h2>
+          <p className="text-[11px] text-[#202522]/60 font-sans mt-0.5">
+            Quality assessment based on structural and heuristic checks. Not an absolute guarantee.
+          </p>
         </div>
 
         <div className="flex items-center gap-2">
+          {isSampled && (
+            <div className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 text-xs font-sans">
+              <AlertTriangle className="h-3 w-3 text-amber-600 shrink-0" />
+              <span>Sampled ({sampleSize ?? 1000} of {totalRows ?? 'all'} rows)</span>
+            </div>
+          )}
           {activeIssueFilter && (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#202522] text-white text-xs font-sans">
               <Filter className="h-3 w-3" />

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -8,11 +8,12 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { ArrowRight, CheckCircle2, Table2 } from 'lucide-react';
+import { ArrowRight, CheckCircle2, Table2, AlertTriangle, AlertCircle } from 'lucide-react';
 import {
   CRM_TARGET_SCHEMA,
   ECOMMERCE_TARGET_SCHEMA,
   suggestSchemaMapping,
+  validateSchemaMapping,
   type TargetSchema,
 } from '@/lib/schemaMapping';
 
@@ -52,21 +53,27 @@ export function SchemaMappingDialog({
     }));
   };
 
+  // Real-time collision & validation check (P0.9)
+  const validation = useMemo(() => {
+    return validateSchemaMapping(mapping, selectedSchema);
+  }, [mapping, selectedSchema]);
+
   const handleConfirm = () => {
+    if (!validation.isValid) return;
     onApplyMapping(mapping);
     onOpenChange(false);
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl bg-white border border-[#E5E5DE] shadow-xl">
+      <DialogContent className="max-w-2xl bg-white border border-[#E5E5DE] shadow-xl p-6">
         <DialogHeader>
           <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#2F8F6B] text-white">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#2F8F6B]/10 text-[#2F8F6B]">
               <Table2 className="h-4 w-4" />
             </div>
-            <DialogTitle className="font-sans font-bold text-lg text-[#202522]">
-              Standard Schema Mapping
+            <DialogTitle className="text-base sm:text-lg font-bold text-[#202522] font-sans">
+              Map Dataset to Destination Schema
             </DialogTitle>
           </div>
           <DialogDescription className="text-xs text-[#202522]/70 font-sans">
@@ -100,8 +107,33 @@ export function SchemaMappingDialog({
           </button>
         </div>
 
+        {/* Collision Warning Banner (P0.9) */}
+        {validation.collisions.length > 0 && (
+          <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-900 flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-red-600 mt-0.5" />
+            <div className="space-y-1">
+              <span className="font-bold">Schema Mapping Collision Detected</span>
+              {validation.collisions.map((c, i) => (
+                <p key={i} className="text-[11px] leading-relaxed">
+                  {c.message}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Missing Required Fields Notice */}
+        {validation.missingRequired.length > 0 && validation.collisions.length === 0 && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-900 flex items-center gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+            <span className="text-[11px]">
+              Destination requires: <strong>{validation.missingRequired.map((m) => m.label).join(', ')}</strong>. You can still apply, but these fields will be blank.
+            </span>
+          </div>
+        )}
+
         {/* Mapping Table */}
-        <div className="max-h-[340px] overflow-auto rounded-xl border border-[#E5E5DE] bg-[#F7F5EF]/40 p-1">
+        <div className="max-h-[320px] overflow-auto rounded-xl border border-[#E5E5DE] bg-[#F7F5EF]/40 p-1">
           <table className="w-full text-xs font-sans">
             <thead>
               <tr className="border-b border-[#E5E5DE] text-[#202522]/60 font-mono text-[11px]">
@@ -116,8 +148,18 @@ export function SchemaMappingDialog({
                 const currentMapped = mapping[h] || h;
                 const isMatched = currentMapped !== h;
 
+                // Check if this row is involved in a collision
+                const hasCollision = validation.collisions.some((c) =>
+                  c.sourceColumns.includes(h)
+                );
+
                 return (
-                  <tr key={h} className="hover:bg-[#F7F5EF]/60">
+                  <tr
+                    key={h}
+                    className={`transition-colors ${
+                      hasCollision ? 'bg-red-50/60' : 'hover:bg-[#F7F5EF]/60'
+                    }`}
+                  >
                     <td className="py-2 px-3 font-mono font-medium text-[#202522]">
                       {h}
                     </td>
@@ -128,18 +170,26 @@ export function SchemaMappingDialog({
                       <select
                         value={currentMapped}
                         onChange={(e) => handleFieldChange(h, e.target.value)}
-                        className="w-full rounded-md border border-[#E5E5DE] bg-white px-2 py-1 text-xs font-mono text-[#202522] focus:border-[#2F8F6B] focus:outline-none cursor-pointer"
+                        className={`w-full rounded-md border px-2 py-1 text-xs font-mono text-[#202522] focus:outline-none cursor-pointer ${
+                          hasCollision
+                            ? 'border-red-400 bg-red-50 text-red-900'
+                            : 'border-[#E5E5DE] bg-white focus:border-[#2F8F6B]'
+                        }`}
                       >
                         <option value={h}>(Keep as "{h}")</option>
                         {selectedSchema.fields.map((f) => (
                           <option key={f.key} value={f.key}>
-                            {f.key} ({f.label})
+                            {f.key} ({f.label}) {f.required ? '*' : ''}
                           </option>
                         ))}
                       </select>
                     </td>
                     <td className="py-2 px-3 text-right">
-                      {isMatched ? (
+                      {hasCollision ? (
+                        <span className="inline-flex items-center gap-1 font-mono text-[10px] text-red-700 font-semibold bg-red-100 px-2 py-0.5 rounded">
+                          Collision
+                        </span>
+                      ) : isMatched ? (
                         <span className="inline-flex items-center gap-1 font-mono text-[10px] text-[#2F8F6B] font-semibold bg-[#2F8F6B]/10 px-2 py-0.5 rounded">
                           <CheckCircle2 className="h-2.5 w-2.5" /> Mapped
                         </span>
@@ -158,7 +208,7 @@ export function SchemaMappingDialog({
 
         <DialogFooter className="flex items-center justify-between sm:justify-between pt-2">
           <span className="text-[11px] font-mono text-[#202522]/60">
-            No columns will be removed or dropped.
+            No unmapped columns will be dropped.
           </span>
           <div className="flex gap-2">
             <Button
@@ -172,7 +222,12 @@ export function SchemaMappingDialog({
             <Button
               size="sm"
               onClick={handleConfirm}
-              className="bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white text-xs font-semibold cursor-pointer shadow-2xs"
+              disabled={!validation.isValid}
+              className={`text-white text-xs font-semibold shadow-2xs ${
+                validation.isValid
+                  ? 'bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 cursor-pointer'
+                  : 'bg-[#202522]/30 cursor-not-allowed opacity-60'
+              }`}
             >
               Apply Schema Mapping
             </Button>

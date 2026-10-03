@@ -622,15 +622,16 @@ export function analyzeDataset(
   };
 }
 
-export function deduplicateRows(
+export function deduplicateRows<T extends Record<string, string>>(
   headers: string[],
-  rows: Record<string, string>[]
-): Record<string, string>[] {
+  rows: T[]
+): T[] {
+  const cleanHeaders = headers.filter((h) => h !== '_tr_id');
   const seen = new Set<string>();
-  const uniqueRows: Record<string, string>[] = [];
+  const uniqueRows: T[] = [];
 
   for (const row of rows) {
-    const sig = headers.map((h) => (row[h] ?? '').trim().toLowerCase()).join('||');
+    const sig = cleanHeaders.map((h) => (row[h] ?? '').trim().toLowerCase()).join('||');
     if (!seen.has(sig)) {
       seen.add(sig);
       uniqueRows.push(row);

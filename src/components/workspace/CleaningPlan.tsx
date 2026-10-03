@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   CheckCircle2,
@@ -16,14 +16,19 @@ import {
   Check,
   Sliders,
   Users,
+  BookOpen,
+  SplitSquareVertical,
 } from 'lucide-react';
-import type { DatasetAnalysis, FuzzyDuplicateCandidate } from '@/lib/analyzer';
+import type { DatasetAnalysis } from '@/lib/analyzer';
 import type { CleaningStep, CleaningWorkflow } from '@/lib/workflows';
+import { STANDARD_RECIPES, type CleaningRecipe } from '@/lib/core/recipes';
+import { resolveEntities, type EntityResolutionReport, type EntityResolutionGroup } from '@/lib/core/entityResolution';
 
 interface CleaningPlanProps {
   fileName: string;
   analysis: DatasetAnalysis;
   headers: string[];
+  rows?: (Record<string, string> & { _tr_id?: string })[];
   onApplyAllRecommended: () => void;
   onRemoveDuplicates: () => void;
   onStandardizeTitleCase: () => void;
@@ -34,6 +39,7 @@ interface CleaningPlanProps {
   onExecutePlan: (steps: CleaningStep[]) => void;
   savedWorkflows: CleaningWorkflow[];
   onApplyWorkflow: (workflow: CleaningWorkflow) => void;
+  onApplyRecipe?: (recipe: CleaningRecipe) => void;
   onSaveCurrentAsWorkflow: (name: string, description: string, steps: CleaningStep[]) => void;
   hasAppliedCleanups: boolean;
 }
@@ -42,6 +48,7 @@ export function CleaningPlan({
   fileName,
   analysis,
   headers,
+  rows,
   onApplyAllRecommended,
   onRemoveDuplicates,
   onStandardizeTitleCase,
@@ -52,14 +59,44 @@ export function CleaningPlan({
   onExecutePlan,
   savedWorkflows,
   onApplyWorkflow,
+  onApplyRecipe,
   onSaveCurrentAsWorkflow,
   hasAppliedCleanups,
 }: CleaningPlanProps) {
-  const [activeTab, setActiveTab] = useState<'diagnosis' | 'plan' | 'fuzzy' | 'workflows'>('diagnosis');
+  const [activeTab, setActiveTab] = useState<'diagnosis' | 'plan' | 'entities' | 'workflows'>('diagnosis');
   const [naturalCommand, setNaturalCommand] = useState('');
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [saveWorkflowName, setSaveWorkflowName] = useState('');
   const [showSaveWorkflowInput, setShowSaveWorkflowInput] = useState(false);
+
+  // Map rows by _tr_id for fast lookup in entity groups
+  const rowMap = useMemo(() => {
+    const map = new Map<string, Record<string, string>>();
+    if (rows) {
+      for (const r of rows) {
+        if (r._tr_id) map.set(r._tr_id, r);
+      }
+    }
+    return map;
+  }, [rows]);
+
+  // Compute entity resolution groups across dataset
+  const entityReport = useMemo<EntityResolutionReport>(() => {
+    if (!rows || rows.length === 0) {
+      return {
+        totalRows: 0,
+        totalGroups: 0,
+        exactDuplicateCount: 0,
+        normalizedDuplicateCount: 0,
+        fuzzyDuplicateCount: 0,
+        likelySameEntityCount: 0,
+        unresolvedCount: 0,
+        groups: [],
+        assessmentNotice: '',
+      };
+    }
+    return resolveEntities(headers, rows as any);
+  }, [headers, rows]);
 
   // Staged cleaning plan derived dynamically from detected issues
   const [stagedSteps, setStagedSteps] = useState<CleaningStep[]>([
@@ -323,30 +360,31 @@ export function CleaningPlan({
           >
             Review Cleaning Plan ({stagedSteps.filter((s) => s.enabled).length} steps)
           </button>
-          {analysis.fuzzyDuplicates.length > 0 && (
+          {(entityReport.groups.length > 0 || analysis.fuzzyDuplicates.length > 0) && (
             <button
               type="button"
-              onClick={() => setActiveTab('fuzzy')}
+              onClick={() => setActiveTab('entities')}
               className={`px-3 py-1.5 rounded-lg text-xs font-sans font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'fuzzy'
+                activeTab === 'entities'
                   ? 'bg-amber-800 text-white'
                   : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
               }`}
             >
               <Users className="h-3 w-3" />
-              <span>Potential Duplicates ({analysis.fuzzyDuplicates.length})</span>
+              <span>Duplicate & Entity Resolution ({entityReport.groups.length || analysis.fuzzyDuplicates.length})</span>
             </button>
           )}
           <button
             type="button"
             onClick={() => setActiveTab('workflows')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-sans font-semibold transition-all cursor-pointer ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-sans font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
               activeTab === 'workflows'
                 ? 'bg-[#202522] text-white'
                 : 'bg-[#F7F5EF] text-[#202522]/80 hover:bg-[#EFECE3]'
             }`}
           >
-            Saved Workflows ({savedWorkflows.length})
+            <BookOpen className="h-3 w-3" />
+            <span>Recipes & Workflows ({STANDARD_RECIPES.length + savedWorkflows.length})</span>
           </button>
         </div>
 
@@ -573,100 +611,279 @@ export function CleaningPlan({
         </div>
       )}
 
-      {/* Tab 3: Potential Fuzzy Duplicates Review (Suggestions only!) */}
-      {activeTab === 'fuzzy' && (
-        <div className="pt-2 space-y-3">
+      {/* Tab 3: Duplicate & Entity Resolution Explainability */}
+      {activeTab === 'entities' && (
+        <div className="pt-2 space-y-4">
           <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 font-sans flex items-start gap-2">
             <Info className="h-4 w-4 shrink-0 text-amber-700 mt-0.5" />
             <div>
-              <span className="font-bold">Fuzzy Duplicate Review: </span>
-              These records share key identifiers (e.g. matching email) but have differing attributes. TidyRow presents them for human review and never silently deletes them.
+              <span className="font-bold">Transparent Duplicate & Entity Explainability: </span>
+              TidyRow classifies record matches into exact, normalized, fuzzy, and conflicting entities. Exact and normalized duplicates can be safely auto-merged, while records with conflicting field values require human review.
             </div>
           </div>
 
-          <div className="space-y-2 max-h-[300px] overflow-auto">
-            {analysis.fuzzyDuplicates.map((cand) => (
-              <div
-                key={cand.id}
-                className="p-3.5 rounded-xl border border-[#E5E5DE] bg-white text-xs font-sans flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-              >
-                <div>
-                  <div className="font-mono text-[11px] font-semibold text-[#202522] mb-1">
-                    Matching Field: <span className="text-[#2F8F6B]">{cand.field}</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4 font-mono text-[11px]">
-                    <div className="p-2 rounded bg-[#F7F5EF] border border-[#E5E5DE]">
-                      <span className="text-[#202522]/50 block">Record #{cand.rowAIndex + 1}</span>
-                      <span className="text-[#202522] font-semibold">{cand.valueA}</span>
-                    </div>
-                    <div className="p-2 rounded bg-[#F7F5EF] border border-[#E5E5DE]">
-                      <span className="text-[#202522]/50 block">Record #{cand.rowBIndex + 1}</span>
-                      <span className="text-[#202522] font-semibold">{cand.valueB}</span>
-                    </div>
-                  </div>
-                  <p className="mt-1.5 text-[11px] text-[#202522]/70 font-sans">
-                    {cand.similarityReason}
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="font-mono text-[10px] text-amber-700 bg-amber-100 px-2 py-0.5 rounded">
-                    Needs human decision
-                  </span>
-                </div>
+          {/* Quick Summary Pill Bar */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px]">
+            <div className="p-2.5 rounded-lg bg-white border border-[#E5E5DE]">
+              <span className="text-[#202522]/60 text-[10px] block">Total Duplicate Groups</span>
+              <span className="font-bold text-[#202522] text-sm">{entityReport.groups.length} groups</span>
+            </div>
+            <div className="p-2.5 rounded-lg bg-white border border-[#E5E5DE]">
+              <span className="text-[#202522]/60 text-[10px] block">Safe to Auto-Merge</span>
+              <span className="font-bold text-[#2F8F6B] text-sm">
+                {entityReport.exactDuplicateCount + entityReport.normalizedDuplicateCount} (Exact & Norm)
+              </span>
+            </div>
+            <div className="p-2.5 rounded-lg bg-white border border-[#E5E5DE]">
+              <span className="text-[#202522]/60 text-[10px] block">Manual Review Required</span>
+              <span className="font-bold text-amber-700 text-sm">
+                {entityReport.fuzzyDuplicateCount + entityReport.likelySameEntityCount} (Conflicts/Fuzzy)
+              </span>
+            </div>
+            <div className="p-2.5 rounded-lg bg-white border border-[#E5E5DE] flex items-center justify-between">
+              <div>
+                <span className="text-[#202522]/60 text-[10px] block">Safe Dedup Action</span>
+                <span className="text-xs font-sans text-[#202522]">Merge Safe Matches</span>
               </div>
-            ))}
+              <Button
+                size="sm"
+                onClick={onRemoveDuplicates}
+                className="h-7 px-2.5 text-[11px] bg-[#2F8F6B] text-white hover:bg-[#2F8F6B]/90 cursor-pointer"
+              >
+                Auto-Merge Safe
+              </Button>
+            </div>
+          </div>
+
+          {/* Groups List */}
+          <div className="space-y-3 max-h-[380px] overflow-auto">
+            {entityReport.groups.length === 0 && analysis.fuzzyDuplicates.length === 0 ? (
+              <div className="p-4 text-center text-xs text-[#202522]/60 bg-[#F7F5EF] rounded-xl border border-[#E5E5DE]">
+                No duplicate records or conflicting entities detected.
+              </div>
+            ) : (
+              entityReport.groups.map((grp) => {
+                const survivorRow = rowMap.get(grp.survivorRowId);
+                const candidateRows = grp.matchedRowIds
+                  .map((id) => rowMap.get(id))
+                  .filter((r): r is Record<string, string> => Boolean(r));
+
+                return (
+                  <div
+                    key={grp.groupId}
+                    className={`p-3.5 rounded-xl border bg-white text-xs font-sans space-y-2.5 ${
+                      grp.safeToAutoMerge ? 'border-[#E5E5DE]' : 'border-amber-300'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-[#E5E5DE]">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`font-mono text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                            grp.category === 'exact_duplicate'
+                              ? 'bg-emerald-100 text-emerald-900 border border-emerald-200'
+                              : grp.category === 'normalized_duplicate'
+                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                              : grp.category === 'likely_same_entity'
+                              ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                              : 'bg-blue-50 text-blue-900 border border-blue-200'
+                          }`}
+                        >
+                          {grp.category.replace(/_/g, ' ')}
+                        </span>
+                        <span className="text-[#202522]/70 text-[11px]">
+                          Matched on: <span className="font-mono font-semibold text-[#202522]">{grp.matchingFields.join(', ')}</span>
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {grp.safeToAutoMerge ? (
+                          <span className="font-mono text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
+                            <CheckCircle2 className="h-3 w-3" /> Safe to Auto-Merge
+                          </span>
+                        ) : (
+                          <span className="font-mono text-[10px] text-amber-800 bg-amber-100 px-2 py-0.5 rounded font-semibold flex items-center gap-1">
+                            <AlertTriangle className="h-3 w-3" /> Review Required Before Merging
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Explainability Reason */}
+                    <p className="text-[11px] text-[#202522]/80 leading-relaxed font-sans">
+                      {grp.reason}
+                    </p>
+
+                    {/* Survivor vs Candidate rows */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
+                      <div className="p-2 rounded bg-emerald-50/60 border border-emerald-200">
+                        <span className="text-emerald-900 font-bold block mb-1">
+                          Survivor Record ({grp.survivorRowId || 'Primary'}):
+                        </span>
+                        <div className="text-[#202522] space-y-0.5 truncate">
+                          {grp.matchingFields.map((f) => (
+                            <div key={f} className="truncate">
+                              <span className="text-[#202522]/60">{f}:</span> {survivorRow ? survivorRow[f] || '—' : '—'}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="p-2 rounded bg-[#F7F5EF] border border-[#E5E5DE]">
+                        <span className="text-[#202522]/70 font-bold block mb-1">
+                          Candidate Records ({candidateRows.length}):
+                        </span>
+                        <div className="text-[#202522] space-y-0.5 truncate">
+                          {candidateRows.slice(0, 2).map((cand, ci) => (
+                            <div key={ci} className="truncate">
+                              {grp.matchingFields.map((f) => (
+                                <span key={f} className="mr-2">
+                                  <span className="text-[#202522]/60">{f}:</span> {cand[f] || '—'}
+                                </span>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Conflicting Fields Box if any */}
+                    {grp.conflicts.length > 0 && (
+                      <div className="p-2.5 rounded bg-amber-50 border border-amber-200 space-y-1">
+                        <span className="font-semibold text-amber-900 text-[11px] flex items-center gap-1">
+                          <AlertTriangle className="h-3 w-3 text-amber-700" />
+                          Conflicting Field Values Detected:
+                        </span>
+                        <div className="space-y-1 text-[11px] font-mono">
+                          {grp.conflicts.map((conf, ci) => (
+                            <div key={ci} className="flex items-center justify-between bg-white/80 p-1 rounded border border-amber-100">
+                              <span className="font-semibold text-[#202522]">{conf.column}:</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-emerald-800">Survivor: "{conf.survivorValue}"</span>
+                                <span>vs</span>
+                                <span className="text-red-700">Candidate: "{conf.candidateValue}"</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
           </div>
         </div>
       )}
 
-      {/* Tab 4: Saved Workflows (Repeatability) */}
+      {/* Tab 4: Recipes & Workflows (Standard Quality Recipes + Custom Workflows) */}
       {activeTab === 'workflows' && (
-        <div className="pt-2 space-y-3">
-          <p className="text-xs text-[#202522]/70 font-sans">
-            Repeatable cleaning workflows. Run one on this dataset with one click:
-          </p>
+        <div className="pt-2 space-y-4">
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold font-sans text-[#202522] uppercase tracking-wide flex items-center gap-1.5">
+                <BookOpen className="h-3.5 w-3.5 text-[#2F8F6B]" />
+                <span>Standard Cleaning Recipes (Deterministic Industry Presets)</span>
+              </span>
+              <span className="text-[10px] font-mono text-[#202522]/50">
+                {STANDARD_RECIPES.length} standard recipes
+              </span>
+            </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {savedWorkflows.map((wf) => (
-              <div
-                key={wf.id}
-                className="p-4 rounded-xl border border-[#E5E5DE] bg-white hover:border-[#2F8F6B]/40 transition-colors flex flex-col justify-between"
-              >
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="font-sans font-bold text-xs text-[#202522] flex items-center gap-1.5">
-                      <Layers className="h-3.5 w-3.5 text-[#2F8F6B]" />
-                      {wf.name}
-                    </span>
-                    {wf.isPreset ? (
-                      <span className="font-mono text-[10px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded">
-                        Built-in
-                      </span>
-                    ) : (
-                      <span className="font-mono text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                        Custom
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-[11px] text-[#202522]/70 font-sans leading-relaxed mb-3">
-                    {wf.description}
-                  </p>
-                  <div className="text-[10px] font-mono text-[#202522]/50">
-                    {wf.steps.length} sequential cleaning steps
-                  </div>
-                </div>
-
-                <Button
-                  size="sm"
-                  onClick={() => onApplyWorkflow(wf)}
-                  className="mt-3 w-full h-8 text-xs font-semibold bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white cursor-pointer"
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {STANDARD_RECIPES.map((recipe) => (
+                <div
+                  key={recipe.recipeId}
+                  className="p-3.5 rounded-xl border border-[#E5E5DE] bg-white hover:border-[#2F8F6B]/40 transition-colors flex flex-col justify-between"
                 >
-                  <span>Run This Workflow</span>
-                  <ArrowRight className="h-3 w-3 ml-1" />
-                </Button>
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="font-sans font-bold text-xs text-[#202522]">
+                        {recipe.name}
+                      </span>
+                      <span className="font-mono text-[9px] bg-slate-100 text-slate-800 px-1.5 py-0.5 rounded uppercase">
+                        {recipe.targetDomain}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-[#202522]/70 font-sans leading-relaxed mb-2.5">
+                      {recipe.description}
+                    </p>
+                    <div className="space-y-1 mb-3">
+                      <span className="text-[10px] font-mono text-[#202522]/50 uppercase block">Steps:</span>
+                      {recipe.steps.map((st) => (
+                        <div key={st.stepId} className="text-[10px] font-mono text-[#202522]/80 flex items-center gap-1">
+                          <span className="text-[#2F8F6B] font-bold">✓</span>
+                          <span>{st.name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      if (onApplyRecipe) {
+                        onApplyRecipe(recipe);
+                      }
+                    }}
+                    className="w-full h-7.5 text-xs font-semibold bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white cursor-pointer"
+                  >
+                    <span>Execute Recipe</span>
+                    <ArrowRight className="h-3 w-3 ml-1" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="pt-2 border-t border-[#E5E5DE]">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold font-sans text-[#202522] uppercase tracking-wide flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5 text-[#4D7CFE]" />
+                <span>Custom Saved Workflows ({savedWorkflows.length})</span>
+              </span>
+            </div>
+
+            {savedWorkflows.length === 0 ? (
+              <p className="text-xs text-[#202522]/60 italic font-sans">
+                No custom workflows saved yet. Create a cleaning plan and click "Save as Repeatable Workflow".
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {savedWorkflows.map((wf) => (
+                  <div
+                    key={wf.id}
+                    className="p-3.5 rounded-xl border border-[#E5E5DE] bg-white hover:border-[#2F8F6B]/40 transition-colors flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="font-sans font-bold text-xs text-[#202522] flex items-center gap-1.5">
+                          <Layers className="h-3.5 w-3.5 text-[#2F8F6B]" />
+                          {wf.name}
+                        </span>
+                        <span className="font-mono text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
+                          {wf.isPreset ? 'Built-in' : 'Custom'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-[#202522]/70 font-sans leading-relaxed mb-2">
+                        {wf.description}
+                      </p>
+                      <div className="text-[10px] font-mono text-[#202522]/50">
+                        {wf.steps.length} sequential cleaning steps
+                      </div>
+                    </div>
+
+                    <Button
+                      size="sm"
+                      onClick={() => onApplyWorkflow(wf)}
+                      className="mt-2.5 w-full h-7.5 text-xs font-semibold bg-[#202522] hover:bg-[#202522]/90 text-white cursor-pointer"
+                    >
+                      <span>Run This Workflow</span>
+                      <ArrowRight className="h-3 w-3 ml-1" />
+                    </Button>
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
         </div>
       )}

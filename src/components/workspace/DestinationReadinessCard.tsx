@@ -65,18 +65,18 @@ export function DestinationReadinessCard({
           <div className="flex items-center gap-2">
             <span className="font-mono text-xs font-bold text-[#4D7CFE] uppercase flex items-center gap-1">
               <Compass className="h-3.5 w-3.5" />
-              <span>Commercial Differentiator</span>
+              <span>Readiness Assessment</span>
             </span>
             <span className="h-1.5 w-1.5 rounded-full bg-[#E5E5DE]" />
             <span className="font-mono text-xs text-[#202522]/60">
-              System-Specific Data Preparation
+              Pre-Import Schema Alignment
             </span>
           </div>
           <h2 className="text-lg font-bold text-[#202522] font-sans mt-0.5">
-            Destination Readiness & Schema Packs
+            Destination Readiness Assessment
           </h2>
           <p className="text-xs text-[#202522]/70 font-sans mt-0.5">
-            What are you trying to use this spreadsheet for? Select your destination system to verify readiness.
+            Assessed against the selected {currentPack.systemName} field requirements and import constraints.
           </p>
         </div>
 
@@ -119,7 +119,7 @@ export function DestinationReadinessCard({
           <div className="flex items-center gap-3 shrink-0">
             <div className="text-right">
               <span className="text-[10px] font-mono text-[#202522]/60 uppercase block">
-                Destination Readiness
+                Field Alignment Score
               </span>
               <span
                 className={`font-mono text-2xl font-extrabold block ${
@@ -130,7 +130,7 @@ export function DestinationReadinessCard({
                     : 'text-rose-600'
                 }`}
               >
-                {evaluation.readinessScore}% Ready
+                {evaluation.readinessScore}% Aligned
               </span>
             </div>
 
@@ -220,13 +220,18 @@ export function DestinationReadinessCard({
         </div>
       </div>
 
-      {/* Bottom Actions */}
+      {/* Bottom Actions & Assessment Disclaimer */}
       <div className="pt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-        <span className="text-[#202522]/60 font-mono text-[11px]">
-          Target: {currentPack.systemName} standard import CSV specification
-        </span>
+        <div>
+          <span className="text-[#202522]/60 font-mono text-[11px] block">
+            Target: {currentPack.systemName} standard import CSV specification
+          </span>
+          <span className="text-[10px] text-[#202522]/50 italic block mt-0.5">
+            Pre-import assessment based on {currentPack.systemName} schema specifications. Does not guarantee third-party API acceptance.
+          </span>
+        </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <Button
             size="sm"
             onClick={() =>
@@ -239,7 +244,7 @@ export function DestinationReadinessCard({
             className="h-9 px-4 bg-[#4D7CFE] hover:bg-[#4D7CFE]/90 text-white font-semibold text-xs cursor-pointer shadow-2xs gap-1.5"
           >
             <Wand2 className="h-3.5 w-3.5" />
-            <span>Make Ready for {currentPack.systemName}</span>
+            <span>Apply Recommended {currentPack.systemName} Alignments</span>
           </Button>
 
           <Button
@@ -250,7 +255,7 @@ export function DestinationReadinessCard({
             className="h-9 px-4 bg-[#2F8F6B] hover:bg-[#2F8F6B]/90 text-white font-semibold text-xs cursor-pointer shadow-2xs gap-1.5"
           >
             <Download className="h-3.5 w-3.5" />
-            <span>Download {currentPack.systemName}-Ready CSV</span>
+            <span>Export {currentPack.systemName}-Aligned CSV</span>
           </Button>
         </div>
       </div>
